@@ -1,0 +1,12 @@
+planner_mode: "llm"
+local_mode: true
+index:
+  build_on_startup: true
+  backend: faiss
+  embedder_domain:
+    provider: openai
+    model: text-embedding-3-small
+policy:
+  enabled: false
+  pdf_path: data/agreement/Agreement.pdf
+  store_dir: var/policies

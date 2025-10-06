@@ -1,0 +1,3 @@
+- Statement period: YYYY-MM.
+- DPR = APR/365.
+- Trailing interest: interest after statement close if balance remains.

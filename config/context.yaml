@@ -1,0 +1,14 @@
+enabled: true
+budget:
+  planner_tokens: 4000
+  composer_tokens: 3000
+  per_section_soft: 800
+packs:
+  common: [glossary, formulas, schemas, tool_contracts]
+  interest: [policy_rules, interest_examples]
+  balance: [balance_examples]
+  transactions: [transaction_examples]
+retrieval:
+  policy_top_k: 3
+  policy_min_chars: 400
+  policy_query_expansion: true

@@ -1,0 +1,13 @@
+{
+  "accountId": "0269",
+  "accountNumberLast4": "0269",
+  "accountStatus": "OPEN",
+  "openedDate": "2020-01-15",
+  "currentBalance": 2450.75,
+  "currentAdjustedBalance": 2450.75,
+  "creditLimit": 7000.0,
+  "availableCredit": 4550.25,
+  "minimumDueAmount": 35.0,
+  "paymentDueDate": "2025-10-25",
+  "billingCycleCloseDateTime": "2025-09-30T23:59:59Z"
+}
