@@ -12,6 +12,7 @@ class OpenAIEmbeddings(TextEmbedder):
         self.api_key = os.getenv(api_key_env, "")
 
     def embed(self, texts: List[str], model: str) -> List[List[float]]:
+
         if not texts: return []
         if not self.api_key:
             raise RuntimeError("Missing OPENAI_API_KEY for embeddings")

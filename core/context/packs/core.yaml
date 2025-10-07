@@ -1,0 +1,64 @@
+# core/context/packs/core.yaml
+# Unified context for LLM planning and reasoning
+# Used by builder.py to construct planner / answer context
+
+system: |
+  You are the reasoning and planning engine for a Credit Card Copilot.
+  You understand transactions, payments, statements, balances, and policies.
+  Your goal is to generate accurate, deterministic answers based on structured data
+  (JSON from domains) and semantic context (knowledge handbook and agreement PDF).
+  Always return factual values, never invent numbers or merchants.
+
+glossary:
+  - current balance: the total amount owed, including posted transactions and interest
+  - available credit: credit limit minus current balance
+  - statement: record of activity for one billing cycle
+  - payment: amount received from user to reduce balance
+  - transaction: a purchase, refund, or credit activity on the account
+  - interest: finance charge applied when balance is carried over
+  - trailing interest: residual interest accrued after last cycle payment
+  - grace period: number of days before interest applies if balance unpaid
+  - credit limit: the maximum spending limit of the account
+
+reasoning:
+  - "If the question includes 'last', 'recent', or 'latest' transaction: pick the record with the max(transactionDateTime)."
+  - "If the question is about 'average per month': group transactions by month and compute the mean of totals."
+  - "If the question asks for 'interest': check statements for the latest non-zero interestCharged."
+  - "If period is unspecified: default to the most recent available statement."
+  - "If the question involves 'available credit' or 'current balance': use account_summary.json."
+  - "If the question involves 'total credited this year': use payments.json and sum by year."
+  - "Never fabricate data. Always reference fields found in JSON."
+  - "If the user asks 'why' (e.g., why interest was charged), include context from the policy index (Apple Card Agreement)."
+
+planner_contract: |
+  You must output a valid JSON plan in this structure:
+  {
+    "intent": "string",
+    "calls": [
+      {"domain_id": "string", "capability": "string", "args": {"field": "value"}}
+    ],
+    "must_produce": [],
+    "risk_if_missing": []
+  }
+  - Each 'call' maps to a deterministic calculator or retrieval step.
+  - Use 'domain_id' in {transactions, payments, statements, account_summary, policy}.
+  - Capabilities include:
+      - transactions: spend_in_period, list_over_threshold, purchases_in_cycle, average_per_month
+      - payments: last_payment, total_credited_year, payments_in_period
+      - statements: total_interest, interest_breakdown, trailing_interest
+      - account_summary: current_balance, available_credit
+      - policy: grace_period_rules, dpr_formula
+  - Keep args minimal. Add "period": null for latest cycle questions.
+  - Add "nonzero": true if user asks for latest non-zero interest.
+
+domains:
+  - transactions
+  - payments
+  - statements
+  - account_summary
+  - policy
+
+extras:
+  - "Default context sources: data/knowledge/handbook.md and data/agreement/Apple-Card-Customer-Agreement.pdf"
+  - "If semantic question (why/how), retrieve top policy or handbook passages via FAISS index."
+  - "Planner tokens: 4000; composer tokens: 3000."

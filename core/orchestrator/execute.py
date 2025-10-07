@@ -44,6 +44,34 @@ def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
                 res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
             elif cap == "purchases_in_cycle":
                 res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
+            elif cap == "max_amount":
+                res = txn_calc.max_amount(
+                    txns,
+                    args.get("account_id"),
+                    args.get("period"),
+                    args.get("period_start"),
+                    args.get("period_end"),
+                    args.get("category"),
+                    int(args.get("top", 1)),
+                )
+            elif cap == "aggregate_by_category":
+                res = txn_calc.aggregate_by_category(
+                    txns, args.get("account_id"),
+                    args.get("period"),
+                    args.get("period_start"),
+                    args.get("period_end"),
+                )
+            elif cap == "average_per_month":
+                res = txn_calc.average_per_month(
+                    txns,
+                    args.get("account_id"),
+                    args.get("period"),
+                    args.get("period_start"),
+                    args.get("period_end"),
+                    bool(args.get("include_credits", False)),
+                )
+            elif cap == "compare_periods":
+                res = txn_calc.compare_periods(txns, args.get("account_id"), args.get("period1"), args.get("period2"))
             else:
                 res = {"error": f"Unknown capability {cap}"}
 

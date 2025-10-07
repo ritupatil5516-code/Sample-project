@@ -1,69 +1,130 @@
+# core/context/builder.py
 from __future__ import annotations
-from typing import Dict, Any, List
+
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 import yaml
-from core.retrieval.policy_index import get_policy_snippet
 
-PKG = Path("core/context/packs")
-CFG = Path("config/context.yaml")
 
-def _load_cfg() -> dict:
-    if CFG.exists():
-        return yaml.safe_load(CFG.read_text()) or {}
-    return {"enabled": True, "packs":{}, "budget":{}, "retrieval":{}}
+"""
+builder.py
+----------
+Builds prompt context for the LLM from ONE unified pack:
+  core/context/packs/core.yaml
 
-def _read_pack(name: str) -> str:
-    p = PKG / f"{name}.md"
-    return p.read_text() if p.exists() else ""
+Expected sections inside core.yaml (all optional):
+  system: str                     # main system instruction
+  glossary: list[str] | dict      # key terms
+  reasoning: list[str] | dict     # nudges like "last txn = max(timestamp)"
+  planner_contract: str | dict    # how to emit the plan JSON
+  domains: list[str] | dict       # visible domains (informational)
+  extras: list[str] | dict        # any additional notes you want included
 
-def _cap_budget(texts: List[str], soft_cap: int) -> List[str]:
-    out, total = [], 0
-    for t in texts:
-        if total + len(t) > soft_cap: break
-        out.append(t); total += len(t)
-    return out
+Usage:
+  ctx = build_context(intent="planner", question=..., plan=None)
+  messages = [
+      {"role":"system","content": ctx["system"]},
+      *ctx["context_msgs"],
+      # then your specific planner SYSTEM_CONTRACT + the user message...
+  ]
+"""
 
-def DEFAULT_SYSTEM() -> str:
-    return ("You are a credit-card copilot planner/composer. "
-            "Use ONLY provided data/calculator outputs for numbers. "
-            "Do not invent amounts, dates, or periods. "
-            "Prefer domain field names exactly as shown in schemas. "
-            "For policy explanations, use retrieved policy snippets; do not fabricate rules.")
 
-def build_context(intent: str, question: str, plan: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    cfg = _load_cfg()
-    if not cfg.get("enabled", True):
-        return {"system": DEFAULT_SYSTEM(), "context_msgs": []}
+# ------------------------------- helpers --------------------------------------
 
-    system = DEFAULT_SYSTEM()
-    packs_cfg = cfg.get("packs", {})
-    selected = list(packs_cfg.get("common", []))
+def _safe_yaml_load(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        # malformed YAML → ignore gracefully
+        return {}
 
-    low = ((intent or "") + " " + question).lower()
-    if any(w in low for w in ["interest", "apr", "grace", "trailing"]):
-        selected += packs_cfg.get("interest", [])
-    if any(w in low for w in ["balance", "available credit", "limit"]):
-        selected += packs_cfg.get("balance", [])
-    if any(w in low for w in ["transaction", "spend", "over $", "over$", "merchant"]):
-        selected += packs_cfg.get("transactions", [])
 
-    sections = []
-    for name in selected:
-        txt = _read_pack(name)
-        if txt.strip():
-            sections.append(f"## {name.replace('_',' ').title()}\n{txt.strip()}")
+def _as_block(value: Any) -> str:
+    """Normalize lists/dicts/strings into a readable block."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "\n".join(f"- {str(x)}" for x in value)
+    if isinstance(value, dict):
+        lines: List[str] = []
+        for k, v in value.items():
+            if isinstance(v, (list, dict)):
+                dumped = yaml.safe_dump(v, sort_keys=False).strip()
+                lines.append(f"{k}:\n{dumped}")
+            else:
+                lines.append(f"{k}: {v}")
+        return "\n".join(lines)
+    return str(value)
 
-    retrieval_cfg = cfg.get("retrieval", {})
-    need_policy = any(w in low for w in ["why", "interest", "grace", "trailing"])
-    if need_policy:
-        q = question + (" grace period daily periodic rate trailing interest billing cycle" if retrieval_cfg.get("policy_query_expansion", True) else "")
-        res = get_policy_snippet(q) or {}
-        snippet = res.get("snippet") or ""
-        if len(snippet) >= retrieval_cfg.get("policy_min_chars", 400):
-            sections.append("## Policy Snippets\n" + snippet)
 
-    per_section_soft = int(cfg.get("budget", {}).get("per_section_soft", 800))
-    sections = _cap_budget(sections, per_section_soft * len(sections))
-    context_msgs = [{"role":"assistant","content": s} for s in sections]
+def _section_msg(title: str, content: Any) -> Dict[str, str]:
+    body = _as_block(content).strip()
+    if not body:
+        return {}
+    return {"role": "system", "content": f"{title}:\n{body}"}
 
-    return {"system": system, "context_msgs": context_msgs}
+
+# ------------------------------- main API -------------------------------------
+
+def build_context(
+    intent: str,
+    question: Optional[str],
+    plan: Optional[Dict[str, Any]] = None,
+    *,
+    pack_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Build context messages for the given intent.
+    - intent: "planner" | "answer" | anything else (used only to decide which sections to include)
+    - question/plan: not embedded here; caller adds the user message and any plan trace
+    - pack_path: override path to the single pack (default core/context/packs/core.yaml)
+
+    Returns:
+      {
+        "system": str,                 # main system string (may be empty)
+        "context_msgs": List[Msg],     # system messages for glossary/reasoning/contract/etc.
+      }
+    """
+    pack_file = Path(pack_path or "core/context/packs/core.yaml")
+    pack = _safe_yaml_load(pack_file)
+
+    # Extract canonical sections (all optional)
+    system_text        = pack.get("system", "") or ""
+    glossary_section   = pack.get("glossary")
+    reasoning_section  = pack.get("reasoning")
+    contract_section   = pack.get("planner_contract")
+    domains_section    = pack.get("domains")
+    extras_section     = pack.get("extras")
+
+    msgs: List[Dict[str, str]] = []
+
+    # Order matters: glossary → reasoning → (planner contract for planner intent) → domains → extras
+    if glossary_section:
+        msg = _section_msg("Glossary", glossary_section)
+        if msg: msgs.append(msg)
+
+    if reasoning_section:
+        msg = _section_msg("Reasoning", reasoning_section)
+        if msg: msgs.append(msg)
+
+    # Only include planner contract when composing the planning prompt
+    if intent == "planner" and contract_section:
+        msg = _section_msg("Planner Contract", contract_section)
+        if msg: msgs.append(msg)
+
+    if domains_section:
+        msg = _section_msg("Domains", domains_section)
+        if msg: msgs.append(msg)
+
+    if extras_section:
+        msg = _section_msg("Notes", extras_section)
+        if msg: msgs.append(msg)
+
+    return {
+        "system": system_text.strip(),
+        "context_msgs": msgs,
+    }

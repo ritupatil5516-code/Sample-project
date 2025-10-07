@@ -16,11 +16,19 @@ embeddings:
   qwen_model: "qwen3-embedding"
   qwen_api_key_env: "QWEN_API_KEY"
 
-index:
-  build_on_startup: true
-  backend: faiss
-
 policy:
   enabled: true
   pdf_path: data/agreement/Apple-Card-Customer-Agreement.pdf
   store_dir: var/policies
+
+context:
+  packs_dir: core/context/packs
+  planner_packs: [core.yaml]
+
+indexes:
+  dir: var/indexes
+  rebuild_on_startup: false
+  sources:
+    - data/folder
+    - data/knowledge/handbook.md
+    - data/agreement/Apple-Card-Customer-Agreement.pdf

@@ -1,4 +1,0 @@
-- statements.total_interest(period) -> interest_total
-- statements.interest_breakdown(period) -> interest_total, non_trailing, trailing
-- account_summary.current_balance() -> current_balance
-- account_summary.available_credit() -> available_credit, credit_limit

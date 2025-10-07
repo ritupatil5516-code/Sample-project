@@ -46,3 +46,16 @@ def build_llm_from_config(cfg: dict) -> ChatLLM:
         return LlamaChat(base_url=(cfg["llm"]["base_url"]))
     else:
         raise ValueError(f"Unknown LLM provider: {prov}")
+
+def get_embedding_model():
+    """
+    Returns a callable that can embed a text using the configured model.
+    """
+    client = OpenAIChat(api_key=os.getenv("OPENAI_API_KEY"))
+    model = os.getenv("EMBED_MODEL", "text-embedding-3-large")
+
+    def _embed(text: str):
+        res = client.embeddings.create(model=model, input=text)
+        return res.data[0].embedding
+
+    return _embed

@@ -1,8 +1,10 @@
+import os
 import sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from dotenv import load_dotenv
 
 import json, requests, yaml, streamlit as st
 from core.index.startup import build_on_startup
@@ -10,10 +12,13 @@ from core.orchestrator.planner import make_plan
 from core.orchestrator.execute import execute_calls
 from core.orchestrator.compose import compose_answer
 from core.orchestrator.verify import verify
-
+load_dotenv()
 st.set_page_config(page_title="Credit Card Co-Pilot", page_icon="💳", layout="centered")
+st.sidebar.caption(f"OPENAI key detected: {'yes' if (os.getenv('OPENAI_API_KEY') or '').strip() else 'no'}")
 APP = yaml.safe_load(Path("config/app.yaml").read_text())
-build_on_startup()
+if "indexes_built" not in st.session_state:
+    build_on_startup()
+    st.session_state.indexes_built = True
 
 st.sidebar.header("Settings")
 planner_mode = st.sidebar.selectbox("Planner mode", ["llm","rule"], index=0 if APP.get("planner_mode")=="llm" else 1)
