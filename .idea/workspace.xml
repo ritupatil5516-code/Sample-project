@@ -4,7 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="8995c3af-8f90-402c-86b4-9fc976f7a0d7" name="Changes" comment="one with some errors">
+    <list default="true" id="8995c3af-8f90-402c-86b4-9fc976f7a0d7" name="Changes" comment="Working model">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/core/orchestrator/compose.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/compose.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/core/orchestrator/execute.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/execute.py" afterDir="false" />
@@ -138,7 +138,15 @@
       <option name="project" value="LOCAL" />
       <updated>1759821136748</updated>
     </task>
-    <option name="localTasksCounter" value="5" />
+    <task id="LOCAL-00005" summary="Working model">
+      <option name="closed" value="true" />
+      <created>1759848388196</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1759848388196</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -156,6 +164,7 @@
     <MESSAGE value="initial changes" />
     <MESSAGE value="workingmodel" />
     <MESSAGE value="one with some errors" />
-    <option name="LAST_COMMIT_MESSAGE" value="one with some errors" />
+    <MESSAGE value="Working model" />
+    <option name="LAST_COMMIT_MESSAGE" value="Working model" />
   </component>
 </project>

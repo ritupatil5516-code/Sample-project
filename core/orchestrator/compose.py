@@ -65,10 +65,24 @@ def compose_answer(question: str, plan: Dict[str, Any], results: Dict[str, Any])
         data = results[k] or {}
         tops = (data.get("top_merchants") or [])[:5]
         if not tops:
-            return {"answer": "I didn’t find any merchant spend."}
-        parts = [f"{row['merchant']}: {_fmt_money(row['total'])}" for row in tops]
-        line = "You spent the most at: " + "; ".join(parts) + "."
-        return {"answer": line}
+            return {"answer": "I didn’t find any merchant spend in that period."}
+        lines = [f"- {row['merchant']}: {_fmt_money(row['total'])}" for row in tops]
+        return {"answer": "You spent the most at:\n\n" + "\n".join(lines)}
+
+    k = "transactions.find_by_merchant"
+    if k in results:
+        data = results[k] or {}
+        items = data.get("items") or []
+        if not items:
+            mq = (data.get("trace") or {}).get("merchant_query") or "that merchant"
+            return {"answer": f"I didn’t find any purchases from {mq} in that period."}
+        lines = []
+        for t in items[:20]:
+            date = _fmt_iso_date(t.get("transactionDateTime") or t.get("postedDateTime") or t.get("date"))
+            amt = _fmt_money(t.get("amount"))
+            merch = t.get("merchantName") or "UNKNOWN"
+            lines.append(f"- {date}: {amt} at {merch}")
+        return {"answer": "Here’s what I found:\n\n" + "\n".join(lines)}
 
     # -------------- 3) statements.total_interest -----------------------------
     k = "statements.total_interest"
@@ -169,4 +183,25 @@ def compose_answer(question: str, plan: Dict[str, Any], results: Dict[str, Any])
     if any_key:
         return {"answer": f"Here is what I found: {any_key}. Open 'Trace & plan' for details."}
 
-    return {"answer": "I couldn’t find an answer."}
+    # ---------------------------------------------------------------------
+    # 🧩 Universal fallback for missing or invalid responses
+    # ---------------------------------------------------------------------
+    try:
+        # If the model produced no known capabilities or an empty result set
+        if not results:
+            return {"answer": "No information found."}
+
+        # If all keys in results are empty, null, or contain 'error'
+        valid_keys = [k for k, v in results.items() if v and not v.get("error")]
+        if not valid_keys:
+            return {"answer": "No information found."}
+
+        # If planner failed or produced empty plan
+        if not plan or not plan.get("calls"):
+            return {"answer": "No information found."}
+    except Exception:
+        # If anything goes wrong during composing, don't crash — fallback safely
+        return {"answer": "No information found."}
+
+    # If somehow the control flow reaches here (nothing matched any branch)
+    return {"answer": "No information found."}
