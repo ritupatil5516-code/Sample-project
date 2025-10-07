@@ -3,30 +3,18 @@
     "statementId": "s-2025-04",
     "accountId": "0269",
     "period": "2025-04",
-    "openingDateTime": "2025-04-01T00:00:00Z",
     "closingDateTime": "2025-04-30T23:59:59Z",
-    "dueDate": "2025-05-25",
     "interestCharged": 49.89,
     "totalNonTrailingInterest": 30.0,
-    "totalTrailingInterest": 19.89,
-    "isTrailingInterestApplied": true,
-    "totalPayments": 500.0,
-    "totalCreditsAndReturns": 0,
-    "pastDue": 0
+    "totalTrailingInterest": 19.89
   },
   {
     "statementId": "s-2025-09",
     "accountId": "0269",
     "period": "2025-09",
-    "openingDateTime": "2025-09-01T00:00:00Z",
     "closingDateTime": "2025-09-30T23:59:59Z",
-    "dueDate": "2025-10-25",
     "interestCharged": 0.0,
     "totalNonTrailingInterest": 0.0,
-    "totalTrailingInterest": 0.0,
-    "isTrailingInterestApplied": false,
-    "totalPayments": 300.0,
-    "totalCreditsAndReturns": 0,
-    "pastDue": 0
+    "totalTrailingInterest": 0.0
   }
 ]

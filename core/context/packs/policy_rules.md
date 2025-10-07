@@ -1,2 +1,2 @@
-- Use policy snippets from Agreement.pdf for explanations.
+- Use policy snippets from Agreement PDF for explanations.
 - Do not fabricate rule text.

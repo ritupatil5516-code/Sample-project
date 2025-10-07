@@ -1,12 +1,26 @@
 planner_mode: "llm"
 local_mode: true
+
+llm:
+  provider: openai
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  api_key_env: "OPENAI_API_KEY"
+
+embeddings:
+  provider: openai
+  openai_base_url: "https://api.openai.com/v1"
+  openai_model: "text-embedding-3-large"
+  openai_api_key_env: "OPENAI_API_KEY"
+  qwen_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  qwen_model: "qwen3-embedding"
+  qwen_api_key_env: "QWEN_API_KEY"
+
 index:
   build_on_startup: true
   backend: faiss
-  embedder_domain:
-    provider: openai
-    model: text-embedding-3-small
+
 policy:
-  enabled: false
-  pdf_path: data/agreement/Agreement.pdf
+  enabled: true
+  pdf_path: data/agreement/Apple-Card-Customer-Agreement.pdf
   store_dir: var/policies

@@ -1,4 +1,5 @@
-import os, json, httpx
+import json, yaml
+from core.llm.providers import build_llm_from_config
 from core.context.builder import build_context
 
 SYSTEM = (
@@ -26,23 +27,10 @@ EXAMPLE = {
   "risk_if_missing": []
 }
 
-def _client():
-    base = (os.getenv("OPENAI_API_BASE") or "https://api.openai.com/v1").strip()
-    key  = (os.getenv("OPENAI_API_KEY") or "").strip()
-    model = (os.getenv("PLANNER_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
-    return base, key, model
-
-def _chat_completion(messages, temperature=0):
-    base, key, model = _client()
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": temperature}
-    with httpx.Client(base_url=base, timeout=30.0) as client:
-        r = client.post("/chat/completions", headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"]
-
 def llm_plan(question: str):
+    cfg = yaml.safe_load(open("config/app.yaml").read())
+    llm = build_llm_from_config(cfg)
+
     ctx = build_context(intent="planner", question=question, plan=None)
     messages = [
         {"role":"system","content": ctx["system"]},
@@ -50,7 +38,7 @@ def llm_plan(question: str):
         {"role":"system","content": SYSTEM},
         {"role":"user","content": "Question: " + question + "\nReturn ONLY JSON. Example: " + json.dumps(EXAMPLE)}
     ]
-    txt = _chat_completion(messages)
+    txt = llm.complete(messages, model=cfg["llm"]["model"], temperature=0)
     start = txt.find("{"); end = txt.rfind("}")
     if start >= 0 and end >= 0 and end > start:
         txt = txt[start:end+1]

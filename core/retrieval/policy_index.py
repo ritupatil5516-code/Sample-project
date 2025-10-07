@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 import yaml
 from .policy_faiss import ensure_policy_index as _ensure_policy_index, query_policy as _query_policy
 
@@ -10,12 +10,12 @@ def ensure_policy_index() -> None:
     if _policy_enabled():
         _ensure_policy_index()
 
-def get_policy_snippet(capability: str, store_dir: Optional[str] = None) -> Dict[str, Any]:
+def get_policy_snippet(capability_or_query: str) -> Dict[str, Any]:
     if not _policy_enabled():
         return {"snippet":"", "citation": None, "error": "policy_disabled"}
     try:
         _ensure_policy_index()
-        res = _query_policy(capability, store_dir=store_dir, top_k=3) or {}
+        res = _query_policy(capability_or_query) or {}
         return {"snippet": res.get("snippet", ""), "citation": res.get("citation"),
                 "snippets": res.get("snippets"), "ids": res.get("ids"), "scores": res.get("scores")}
     except Exception as e:

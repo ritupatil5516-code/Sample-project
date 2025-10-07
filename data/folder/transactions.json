@@ -3,36 +3,24 @@
     "transactionId": "t1",
     "accountId": "0269",
     "transactionDateTime": "2025-04-10T12:32:00Z",
-    "displayTransactionType": "Purchase",
     "merchantName": "Apple Store",
     "amount": 1299.99,
-    "transactionType": "DEBIT",
-    "endingBalance": 3750.25,
-    "debitCreditIndicator": "DEBIT",
-    "cardType": "CREDIT"
+    "transactionType": "DEBIT"
   },
   {
     "transactionId": "t2",
     "accountId": "0269",
     "transactionDateTime": "2025-04-15T18:20:00Z",
-    "displayTransactionType": "Purchase",
     "merchantName": "Airbnb",
     "amount": 540.0,
-    "transactionType": "DEBIT",
-    "endingBalance": 4290.25,
-    "debitCreditIndicator": "DEBIT",
-    "cardType": "CREDIT"
+    "transactionType": "DEBIT"
   },
   {
     "transactionId": "t3",
     "accountId": "0269",
     "transactionDateTime": "2025-09-05T09:01:00Z",
-    "displayTransactionType": "Purchase",
     "merchantName": "Amazon",
     "amount": 86.2,
-    "transactionType": "DEBIT",
-    "endingBalance": 2336.95,
-    "debitCreditIndicator": "DEBIT",
-    "cardType": "CREDIT"
+    "transactionType": "DEBIT"
   }
 ]

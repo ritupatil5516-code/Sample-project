@@ -90,7 +90,7 @@ def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
                 res = {"error": f"Unknown capability {cap}"}
 
         elif dom == "policy":
-            res = get_policy_snippet(cap, config_paths.get("policy_store_dir"))
+            res = get_policy_snippet(cap)
 
         else:
             res = {"error": f"Unknown domain {dom}"}

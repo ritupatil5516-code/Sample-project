@@ -1,13 +1,5 @@
 from pathlib import Path
 import yaml
-# core/index/startup.py (top of file)
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 from core.index.domain_faiss import DomainIndex
 from core.retrieval.policy_faiss import ensure_policy_index
 from domains.transactions.loader import load_transactions
@@ -15,11 +7,8 @@ from domains.payments.loader import load_payments
 from domains.statements.loader import load_statements
 from domains.account_summary.loader import load_account_summary
 
-
-CFG_PATH = Path("config/app.yaml")
 def _cfg():
-    if CFG_PATH.exists(): return yaml.safe_load(CFG_PATH.read_text()) or {}
-    return {}
+    return yaml.safe_load(Path("config/app.yaml").read_text())
 
 def _rows_to_text(rows, domain: str):
     chunks = []
@@ -44,14 +33,16 @@ def _rows_to_text(rows, domain: str):
 def build_on_startup():
     cfg = _cfg()
     if not (cfg.get('index', {}).get('build_on_startup', True)): return
+
     txns = load_transactions('data/folder/transactions.json')
     pays = load_payments('data/folder/payments.json')
     stmts = load_statements('data/folder/statements.json')
     acct  = load_account_summary('data/folder/account_summary.json')
     acct_rows = [acct] if acct else []
-    if txns: DomainIndex('transactions').ensure(_rows_to_text(txns, 'transactions'))
-    if pays: DomainIndex('payments').ensure(_rows_to_text(pays, 'payments'))
-    if stmts: DomainIndex('statements').ensure(_rows_to_text(stmts, 'statements'))
-    if acct_rows: DomainIndex('account_summary').ensure(_rows_to_text(acct_rows, 'account_summary'))
-    if (cfg.get('policy') or {}).get('enabled', False):
-        ensure_policy_index()
+
+    if txns: DomainIndex('transactions', cfg).ensure(_rows_to_text(txns, 'transactions'))
+    if pays: DomainIndex('payments', cfg).ensure(_rows_to_text(pays, 'payments'))
+    if stmts: DomainIndex('statements', cfg).ensure(_rows_to_text(stmts, 'statements'))
+    if acct_rows: DomainIndex('account_summary', cfg).ensure(_rows_to_text(acct_rows, 'account_summary'))
+
+    ensure_policy_index()

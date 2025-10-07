@@ -1,8 +1,5 @@
 import sys
 from pathlib import Path
-import sys
-from pathlib import Path
-
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -15,10 +12,7 @@ from core.orchestrator.compose import compose_answer
 from core.orchestrator.verify import verify
 
 st.set_page_config(page_title="Credit Card Co-Pilot", page_icon="💳", layout="centered")
-
-with open("config/app.yaml") as f:
-    APP = yaml.safe_load(f)
-
+APP = yaml.safe_load(Path("config/app.yaml").read_text())
 build_on_startup()
 
 st.sidebar.header("Settings")
@@ -62,7 +56,7 @@ if prompt:
     with st.chat_message("assistant"):
         ph = st.empty(); ph.markdown("…thinking")
         try:
-            out = run_local(prompt) if local_mode else requests.post(base_url.rstrip('/')+'/ask', json={"session_id":session_id,"question":prompt}, timeout=30).json()
+            out = run_local(prompt) if local_mode else requests.post(base_url.rstrip('/')+'/ask', json={"session_id":session_id,"question":prompt}, timeout=60).json()
             ans = out.get("answer", {}) or {}; text = ans.get("answer") or "No answer."
             ph.markdown(text)
             plan = out.get("plan"); results = out.get("results")
