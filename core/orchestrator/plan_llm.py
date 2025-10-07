@@ -22,6 +22,42 @@ print("[PLANNER DEBUG] base_url =", base)
 print("[PLANNER DEBUG] key_env =", key_env, "present?" , bool(key))
 # ------------------------------ config helpers --------------------------------
 
+def _coerce_chat_messages(msgs):
+    """
+    Ensure every message has str content (or a valid OpenAI content array).
+    - dict content with 'content' str -> keep
+    - dict content without 'content' -> json.dumps
+    - None -> drop the message
+    - list content (already an array-of-parts) -> keep as-is
+    """
+    out = []
+    for i, m in enumerate(msgs or []):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if content is None:
+            # drop empty messages
+            continue
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+            continue
+        if isinstance(content, list):
+            # Assume it's already OpenAI "array of parts" format
+            out.append({"role": role, "content": content})
+            continue
+        if isinstance(content, dict):
+            # If nested dict with 'content' str, unwrap; else JSON-serialize
+            inner = content.get("content") if "content" in content else None
+            if isinstance(inner, str):
+                out.append({"role": role, "content": inner})
+            else:
+                out.append({"role": role, "content": json.dumps(content, ensure_ascii=False)})
+            continue
+        # Fallback: stringify anything else
+        out.append({"role": role, "content": str(content)})
+    return out
+
 def _read_app_cfg() -> Dict[str, Any]:
     cfg_path = Path("config/app.yaml")
     if not cfg_path.exists():
@@ -35,68 +71,71 @@ def _read_app_cfg() -> Dict[str, Any]:
 # ------------------------------- LLM wrapper ----------------------------------
 
 class _LLMClient:
-    """
-    Minimal chat-completions client over HTTP.
-    Default: OpenAI-compatible (gpt-4o-mini).
-    Later you can swap api_base/model/key in config to point at Llama 70B.
-    """
-    def __init__(self, api_base: str, api_key: str, model: str, timeout: float = 30.0):
-        # normalize base to include scheme
-        if api_base and not (api_base.startswith("http://") or api_base.startswith("https://")):
-            api_base = "https://" + api_base
-        self.api_base = (api_base or "https://api.openai.com/v1").rstrip("/")
-        self.api_key = api_key or ""
-        self.model = model or "gpt-4o-mini"
-        self.timeout = timeout
+    def __init__(self, api_base, api_key, model):
+        self.api_base = api_base.rstrip("/")
+        self.api_key = api_key
+        self.model = model
 
-    def complete(self, messages: List[Dict[str, str]], model: Optional[str] = None, temperature: float = 0.0) -> str:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+    def complete(self, messages, model=None, temperature=0):
+        url = f"{self.api_base}/chat/completions"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {
             "model": model or self.model,
             "messages": messages,
             "temperature": float(temperature),
         }
-        with httpx.Client(base_url=self.api_base, timeout=self.timeout) as client:
-            r = client.post("/chat/completions", headers=headers, json=payload)
-            r.raise_for_status()
-            data = r.json()
-        return data["choices"][0]["message"]["content"]
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                r = client.post(url, headers=headers, json=payload)
+                # If failure, print server response to see *why*
+                if r.status_code >= 400:
+                    print("[LLM ERROR]", r.status_code, r.text)
+                r.raise_for_status()
+                data = r.json()
+                return data["choices"][0]["message"]["content"]
+        except httpx.HTTPStatusError as e:
+            # Surface the API error text to Streamlit to diagnose quickly
+            raise RuntimeError(f"OpenAI 400: {e.response.text}") from e
+
 
 
 def build_llm_from_config(cfg: Dict[str, Any]) -> _LLMClient:
+    import os
     llm_cfg = (cfg.get("llm") or {})
+
     api_base = llm_cfg.get("api_base") or llm_cfg.get("base_url") or "https://api.openai.com/v1"
-    api_key  = llm_cfg.get("api_key") or llm_cfg.get("key") or ""
-    model    = llm_cfg.get("model") or "gpt-4o-mini"
+    # Prefer explicit api_key, else read from env specified by api_key_env
+    api_key = (llm_cfg.get("api_key") or
+               os.getenv(llm_cfg.get("api_key_env", ""), "") or
+               llm_cfg.get("key") or "")
+    model   = llm_cfg.get("model") or "gpt-4o-mini"
+
+    api_base = api_base.strip()
+    if api_base and not (api_base.startswith("http://") or api_base.startswith("https://")):
+        api_base = "https://" + api_base
+
+    api_key = (api_key or "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "Missing LLM API key. Set llm.api_key in config/app.yaml or export the env var named by llm.api_key_env."
+        )
+
     return _LLMClient(api_base=api_base, api_key=api_key, model=model)
-
-
 # ------------------------------ Planning prompt -------------------------------
 
 SYSTEM_CONTRACT = (
-    "You are a planner for a credit-card copilot.\n"
-    "Given the user's question, output a STRICT JSON object with keys:\n"
-    "{\n"
-    '  "intent": string,\n'
-    '  "calls": [ { "domain_id": string, "capability": string, "args": object } ],\n'
-    '  "must_produce": [],\n'
-    '  "risk_if_missing": []\n'
-    "}\n"
-    "Only include fields listed above. No comments, no extra keys, no markdown.\n"
-    "\n"
-    "Available domains & capabilities:\n"
-    "- transactions: { spend_in_period, list_over_threshold, purchases_in_cycle, last_transaction, average_per_month, compare_periods }\n"
-    "- payments:     { last_payment, total_credited_year, payments_in_period }\n"
-    "- statements:   { total_interest, interest_breakdown, trailing_interest }\n"
-    "- account_summary: { current_balance, available_credit }\n"
-    "\n"
-    "Conventions:\n"
-    "- Periods may be 'YYYY' or 'YYYY-MM'. If user says latest/last/recent, set args.period to null.\n"
-    "- For phrases like 'last interest' or 'most recent interest charged', set args.nonzero=true when relevant.\n"
-    "- Keep args minimal and infer obvious values from the question.\n"
+  "You are a planner for a credit-card copilot. "
+  "Given a user question, output STRICT JSON: "
+  "{intent: string, calls: [{domain_id, capability, args}], must_produce:[], risk_if_missing:[]}. "
+  "Domains/capabilities: "
+  "transactions:{last_transaction, top_merchants, average_per_month, spend_in_period, list_over_threshold, purchases_in_cycle}; "
+  "payments:{last_payment, total_credited_year, payments_in_period}; "
+  "statements:{total_interest, interest_breakdown, trailing_interest}; "
+  "account_summary:{current_balance, available_credit}. "
+  "If the user asks for last/latest/recent interest or omits period, set args.period = null. "
+  "If they say 'last interest' / 'most recent interest charged', also set args.nonzero = true "
+  "so the executor picks the most recent statement with non-zero interest. "
+  "Return ONLY JSON."
 )
 
 # A few tiny patterns so the model learns tool selection quickly.
@@ -182,6 +221,8 @@ def llm_plan(question: str) -> Dict[str, Any]:
             )
         }]
     )
+
+    messages = _coerce_chat_messages(messages)
 
     raw = llm.complete(messages, model=(cfg.get("llm") or {}).get("model"), temperature=0)
 

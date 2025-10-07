@@ -4,42 +4,11 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="8995c3af-8f90-402c-86b4-9fc976f7a0d7" name="Changes" comment="workingmodel">
-      <change afterPath="$PROJECT_DIR$/.env" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/hints.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/packs/core.yaml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/index/faiss_registry.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/index/temporal_registry.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/orchestrator/fallbacks.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/semantics/enrich.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/semantics/synonyms.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/semantics/temporal.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/utils/formatters.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/knowledge/handbook.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/tests/connectivity.py" afterDir="false" />
+    <list default="true" id="8995c3af-8f90-402c-86b4-9fc976f7a0d7" name="Changes" comment="one with some errors">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/streamlit/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/streamlit/app.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/config/app.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/config/app.yaml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/context/builder.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/context/builder.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/context/packs/balance_examples.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/context/packs/formulas.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/context/packs/glossary.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/context/packs/interest_examples.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/context/packs/policy_rules.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/context/packs/schemas.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/context/packs/tool_contracts.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/context/packs/transaction_examples.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/embeddings/providers.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/embeddings/providers.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/index/domain_faiss.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/index/startup.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/index/startup.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/llm/providers.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/llm/providers.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/core/orchestrator/compose.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/compose.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/core/orchestrator/execute.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/execute.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/core/orchestrator/plan_llm.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/plan_llm.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/orchestrator/planner.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/planner.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/retrieval/policy_index.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/retrieval/policy_index.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/domains/transactions/calculator.py" beforeDir="false" afterPath="$PROJECT_DIR$/domains/transactions/calculator.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -161,7 +130,15 @@
       <option name="project" value="LOCAL" />
       <updated>1759809981812</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="one with some errors">
+      <option name="closed" value="true" />
+      <created>1759821136748</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1759821136748</updated>
+    </task>
+    <option name="localTasksCounter" value="5" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -178,6 +155,7 @@
   <component name="VcsManagerConfiguration">
     <MESSAGE value="initial changes" />
     <MESSAGE value="workingmodel" />
-    <option name="LAST_COMMIT_MESSAGE" value="workingmodel" />
+    <MESSAGE value="one with some errors" />
+    <option name="LAST_COMMIT_MESSAGE" value="one with some errors" />
   </component>
 </project>

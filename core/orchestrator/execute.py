@@ -1,4 +1,5 @@
 from typing import Dict, Any, List
+
 from domains.transactions.loader import load_transactions
 from domains.payments.loader import load_payments
 from domains.statements.loader import load_statements
@@ -8,6 +9,28 @@ from domains.payments import calculator as pay_calc
 from domains.statements import calculator as stmt_calc
 from domains.account_summary import calculator as acct_calc
 from core.retrieval.policy_index import get_policy_snippet
+
+def _stmt_key(s: dict) -> str:
+    # prefer closingDateTime, else period, else empty
+    return (s.get("closingDateTime") or s.get("period") or "")
+
+def _pick_latest_stmt(stmts: list[dict], nonzero: bool) -> dict | None:
+    if nonzero:
+        cand = [s for s in stmts if (s.get("interestCharged") or 0) > 0]
+    else:
+        cand = stmts
+    if not cand:
+        return None
+    return max(cand, key=_stmt_key)
+
+def _latest_txn_key(t: dict) -> str:
+    return (t.get("transactionDateTime") or t.get("postedDateTime") or t.get("date") or "")
+
+def _fmt_money(x) -> str:
+    try:
+        return f"${float(x):,.2f}"
+    except Exception:
+        return "$0.00"
 
 def _latest_statement_period_from(stmts: List[dict]):
     periods = [s.get("period") for s in stmts if isinstance(s, dict) and s.get("period")]
@@ -40,6 +63,31 @@ def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
             if cap == "list_over_threshold":
                 thr = float(args.get("threshold", 0))
                 res = txn_calc.list_over_threshold(txns, args.get("account_id"), thr, args.get("period"))
+            elif cap == "last_transaction":
+                # optional account filter
+                aid = args.get("account_id")
+                cand = [t for t in txns if (not aid or t.get("accountId") == aid)]
+                if not cand:
+                    res = {"error": "No transactions", "trace": {"count": 0}}
+                else:
+                    last = max(cand, key=_latest_txn_key)
+                    res = {"item": last, "trace": {"count": len(cand)}}
+
+            elif cap == "top_merchants":
+                # Sum purchases by merchantName, descending
+                aid = args.get("account_id")
+                cand = [t for t in txns if (not aid or t.get("accountId") == aid)]
+                # purchases only (heuristic: DEBIT or positive amount)
+                rows = [t for t in cand if (t.get("transactionType") == "DEBIT" or (t.get("amount") or 0) > 0)]
+                totals = {}
+                for t in rows:
+                    m = (t.get("merchantName") or "UNKNOWN").strip()
+                    totals[m] = totals.get(m, 0.0) + float(t.get("amount") or 0.0)
+                top = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+                res = {
+                    "top_merchants": [{"merchant": m, "total": v} for m, v in top],
+                    "trace": {"count": len(rows)}
+                }
             elif cap == "spend_in_period":
                 res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
             elif cap == "purchases_in_cycle":
@@ -87,16 +135,43 @@ def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
                 res = {"error": f"Unknown capability {cap}"}
 
         elif dom == "statements":
+
+            # fill missing/NULL period
+            nonzero = bool(args.get("nonzero"))
+            if not args.get("period"):
+                pick = _pick_latest_stmt(stmts, nonzero=nonzero)
+                if pick:
+                    args["period"] = pick.get("period")
+                    args["_picked_close"] = pick.get("closingDateTime")
+                    args["_picked_interest"] = pick.get("interestCharged")
+                else:
+                    args["period"] = None
+
             if not args.get("period"):
                 if args.get("nonzero") or intent == "last_interest":
                     args["period"] = _latest_statement_period_with_interest(stmts) or latest_stmt_period
                 else:
                     args["period"] = latest_stmt_period
 
-            if not args.get("period"):
-                res = {"error": "No statements available to determine period", "trace": {"period": None}}
-            elif cap == "total_interest":
-                res = stmt_calc.total_interest(stmts, args.get("account_id"), args["period"])
+            if cap == "total_interest":
+                prd = args.get("period")
+                if prd is None:
+                    res = {"error": "No statements available", "trace": {"period": None}}
+                else:
+                    if args.get("_picked_interest") is not None:
+                        amt = args["_picked_interest"]
+                        res = {"interest_total": amt,
+                               "trace": {"period": prd, "close_date": args.get("_picked_close"), "nonzero": nonzero}}
+                    else:
+                        # find exact period
+                        row = next((s for s in stmts if s.get("period") == prd), None)
+                        if not row:
+                            res = {"error": "No statement for period", "trace": {"period": prd}}
+                        else:
+                            amt = row.get("interestCharged") or 0.0
+                            res = {"interest_total": amt,
+                                   "trace": {"period": prd, "close_date": row.get("closingDateTime"),
+                                             "nonzero": nonzero}}
             elif cap == "interest_breakdown":
                 res = stmt_calc.interest_breakdown(stmts, args.get("account_id"), args["period"])
             elif cap == "trailing_interest":
