@@ -4,52 +4,10 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="8995c3af-8f90-402c-86b4-9fc976f7a0d7" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/.idea/COPilotDemo1.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/server/main.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/streamlit/app.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/config/app.yaml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/config/context.yaml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/builder.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/packs/balance_examples.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/packs/formulas.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/packs/glossary.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/packs/interest_examples.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/packs/policy_rules.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/packs/schemas.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/packs/tool_contracts.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/context/packs/transaction_examples.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/index/domain_faiss.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/index/embedder.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/index/startup.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/orchestrator/compose.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/orchestrator/execute.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/orchestrator/plan_llm.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/orchestrator/planner.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/orchestrator/verify.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/retrieval/policy_faiss.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/core/retrieval/policy_index.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/folder/account_summary.json" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/folder/payments.json" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/folder/statements.json" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/folder/transactions.json" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/account_summary/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/account_summary/calculator.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/account_summary/loader.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/payments/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/payments/calculator.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/payments/loader.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/statements/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/statements/calculator.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/statements/loader.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/transactions/calculator.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/domains/transactions/loader.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+    <list default="true" id="8995c3af-8f90-402c-86b4-9fc976f7a0d7" name="Changes" comment="initial changes">
+      <change afterPath="$PROJECT_DIR$/data/agreement/Agreement.pdf" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/orchestrator/compose.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/compose.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -66,9 +24,21 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 2
-}]]></component>
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;ritupatil5516-code&quot;
+  }
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/ritupatil5516-code/COPilotDemo1.git&quot;,
+    &quot;accountId&quot;: &quot;a5f68879-f881-4299-971e-5b9067d51b4b&quot;
+  }
+}</component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 2
+}</component>
   <component name="ProjectId" id="33fR3WCXe4MMLDvI1iJZyGeJlMq" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
@@ -80,11 +50,12 @@
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.git.unshallow": "true",
     "git-widget-placeholder": "main",
-    "last_opened_file_path": "/Users/ritupatil/PycharmProjects/COPilotDemo1"
+    "last_opened_file_path": "/Users/ritupatil/PycharmProjects/COPilotDemo1/data/agreement"
   }
 }]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/data/agreement" />
       <recent name="$PROJECT_DIR$" />
     </key>
   </component>
@@ -103,6 +74,15 @@
       <option name="presentableId" value="Default" />
       <updated>1759705940671</updated>
     </task>
+    <task id="LOCAL-00001" summary="initial changes">
+      <option name="closed" value="true" />
+      <created>1759766752204</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1759766752204</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -115,5 +95,9 @@
         </entry>
       </map>
     </option>
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="initial changes" />
+    <option name="LAST_COMMIT_MESSAGE" value="initial changes" />
   </component>
 </project>
