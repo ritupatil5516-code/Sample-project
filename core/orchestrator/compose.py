@@ -45,6 +45,21 @@ def compose_answer(question: str, plan: Dict[str, Any], results: Dict[str, Any])
     Returns: {"answer": str, "citations": Optional[list[str]]}
     """
     # -------------- 1) transactions.last_transaction -------------------------
+    k = "transactions.semantic_search"
+    if k in results:
+        data = results[k] or {}
+        hits = data.get("hits") or []
+        if not hits:
+            return {"answer": "No information found."}
+        lines = []
+        for h in hits[:10]:
+            p = h.get("payload") or {}
+            dt = (p.get("transactionDateTime") or p.get("postedDateTime") or p.get("date") or "unknown date")
+            amt = _fmt_money(p.get("amount"))
+            merch = p.get("merchantName") or "UNKNOWN"
+            lines.append(f"- {dt.split('T')[0]}: {amt} at {merch}")
+        return {"answer": "Here’s what matched:\n\n" + "\n".join(lines)}
+
     k = "transactions.last_transaction"
     if k in results:
         data = results[k]
@@ -186,22 +201,20 @@ def compose_answer(question: str, plan: Dict[str, Any], results: Dict[str, Any])
     # ---------------------------------------------------------------------
     # 🧩 Universal fallback for missing or invalid responses
     # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Universal fallback for missing/invalid responses
+    # ---------------------------------------------------------------------
     try:
-        # If the model produced no known capabilities or an empty result set
         if not results:
             return {"answer": "No information found."}
-
-        # If all keys in results are empty, null, or contain 'error'
-        valid_keys = [k for k, v in results.items() if v and not v.get("error")]
-        if not valid_keys:
+        # If all result entries empty or errored
+        valid = [k for k, v in results.items() if v and not v.get("error")]
+        if not valid:
             return {"answer": "No information found."}
-
-        # If planner failed or produced empty plan
         if not plan or not plan.get("calls"):
             return {"answer": "No information found."}
     except Exception:
-        # If anything goes wrong during composing, don't crash — fallback safely
         return {"answer": "No information found."}
 
-    # If somehow the control flow reaches here (nothing matched any branch)
+    # If nothing matched any case, don’t show generic “Here’s what I found…”
     return {"answer": "No information found."}

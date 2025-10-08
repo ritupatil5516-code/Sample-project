@@ -138,6 +138,8 @@ SYSTEM_CONTRACT = (
   "'Where did I spend the most ...' -> transactions.top_merchants (add args.period when a time frame is mentioned; e.g., 'LAST_12M'). "
   "'Did I buy anything from <merchant>?' -> transactions.find_by_merchant with args.merchant_query='<merchant>' (case-insensitive). "
   "Use transactions.semantic_search for fuzzy concepts (e.g., args.query='travel purchases'). "
+  "For brand- or keyword-specific queries (e.g., 'Did I buy anything related to Apple?'), use transactions.semantic_search with args.query and args.alternates, and ALSO setargs.must_include to a lowercase list of the key brand/keyword tokens (e.g., ['apple'])."
+  " The alternates are LLM-generated related terms (brand variants, synonyms, related merchant phrases). Do not invent numbers; this is only for retrieval."
   "Return ONLY JSON."
 )
 

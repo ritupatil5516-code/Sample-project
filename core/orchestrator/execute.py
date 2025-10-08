@@ -1,5 +1,6 @@
 import os
 from typing import Dict, Any, List
+import yaml
 
 from domains.transactions.loader import load_transactions
 from domains.payments.loader import load_payments
@@ -10,9 +11,23 @@ from domains.payments import calculator as pay_calc
 from domains.statements import calculator as stmt_calc
 from domains.account_summary import calculator as acct_calc
 from core.retrieval.policy_index import get_policy_snippet
-# add these imports
 from core.index.faiss_registry import query_index, Embedder
-import yaml
+
+def _read_app_cfg(app_yaml_path: str) -> dict:
+    try:
+        with open(app_yaml_path, "r") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+def _build_embedder_from_cfg(cfg: dict) -> Embedder:
+    emb = (cfg.get("embeddings") or {})
+    provider = (emb.get("provider") or "openai").lower()
+    model = emb.get("openai_model") or emb.get("model") or "text-embedding-3-large"
+    api_base = emb.get("openai_base_url") or emb.get("api_base") or None
+    api_key_env = emb.get("openai_api_key_env") or "OPENAI_API_KEY"
+    api_key = os.getenv(api_key_env, "")
+    return Embedder(provider=provider, model=model, api_key=api_key, api_base=api_base)
 
 def _stmt_key(s: dict) -> str:
     # prefer closingDateTime, else period, else empty
@@ -91,11 +106,41 @@ def _within_period(txn, period: str | None) -> bool:
         return dt >= cutoff
     return True
 
+# ---------- transactions capability implementations (pure functions) ---------
+
+def _txn_semantic_search(txns, args, index_dir, embedder):
+    from core.index.faiss_registry import query_index
+    q_raw = (args.get("query") or args.get("category") or "").strip()
+    alts = args.get("alternates") or []
+    k = int(args.get("k", 5))
+    if not q_raw:
+        return {"hits": [], "error": "query is required", "trace": {"k": k}}
+    queries = [q_raw] + [a for a in alts if isinstance(a, str) and a.strip()]
+    merged = {}
+    for q in queries[:8]:
+        hits = query_index("transactions", q.strip(), top_k=max(1, k), index_dir=index_dir, embedder=embedder)
+        for h in hits:
+            p = h.get("payload") or {}
+            rid = p.get("transactionId") or h.get("idx")
+            score = float(h.get("score", 0.0))
+            prev = merged.get(rid)
+            if (prev is None) or (score > prev["score"]):
+                merged[rid] = {"score": score, "text": h.get("text"), "payload": p, "matched_query": q}
+    aid = args.get("account_id")
+    out = []
+    for _, h in merged.items():
+        if aid and (h["payload"] or {}).get("accountId") != aid:
+            continue
+        out.append(h)
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return {"hits": out[:k], "trace": {"k": k, "query": q_raw, "alternates": alts, "filtered_by_account": bool(aid)}}
+
 def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
     txns = load_transactions("data/folder/transactions.json")
     pays = load_payments("data/folder/payments.json")
     stmts = load_statements("data/folder/statements.json")
     acct  = load_account_summary("data/folder/account_summary.json")
+
     cfg = _read_app_cfg(config_paths["app_yaml"])
     index_dir = ((cfg.get("indexes") or {}).get("dir")) or "var/indexes"
     embedder = _build_embedder_from_cfg(cfg)
@@ -106,39 +151,61 @@ def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
     intent = (config_paths or {}).get("intent")
 
     for call in calls:
-        dom = call.get("domain_id"); cap = call.get("capability"); args = dict(call.get("args", {}))
+
+        # --- normalize + debug -----------------------------------------------
+        dom = str(call.get("domain_id", "")).strip().lower().replace("-", "_")
+        cap = str(call.get("capability", "")).strip().lower().replace("-", "_")
+        args = dict(call.get("args", {}) or {})
         key = f"{dom}.{cap}"
+        print(f"[EXEC DEBUG] dom={dom} cap={cap} args={args}")
+
 
         if dom == "transactions":
             if cap == "semantic_search":
-                # Natural-language search over transaction embeddings (FAISS).
-                q = (args.get("query") or "").strip()
+                # --- SEMANTIC MULTI-QUERY (pure embeddings; no deterministic heuristics) ---
+                q_raw = (args.get("query") or args.get("category") or "").strip()
+                alts = args.get("alternates") or []
                 k = int(args.get("k", 5))
-                if not q:
-                    res = {"error": "query is required", "trace": {"k": k}}
+                if not q_raw:
+                    res = {"hits": [], "error": "query is required", "trace": {"k": k}}
                 else:
-                    hits = query_index(
-                        domain="transactions",
-                        query=q,
-                        top_k=max(1, k),
-                        index_dir=index_dir,
-                        embedder=embedder,
-                    )
-                    # optional account_id filter (post-filter)
+                    # Prepare config + embedder (if you haven’t already done this once per call list)
+                    queries = [q_raw] + [a for a in alts if isinstance(a, str) and a.strip()]
+                    merged = {}
+                    for q in queries[:8]:
+                        hits = query_index(
+                            domain="transactions",
+                            query=q.strip(),
+                            top_k=max(1, k),
+                            index_dir=index_dir,
+                            embedder=embedder,
+                        )
+                        for h in hits:
+                            p = h.get("payload") or {}
+                            rid = p.get("transactionId") or h.get("idx")
+                            score = float(h.get("score", 0.0))
+                            prev = merged.get(rid)
+                            if (prev is None) or (score > prev["score"]):
+                                merged[rid] = {
+                                    "score": score,
+                                    "text": h.get("text"),
+                                    "payload": p,
+                                    "matched_query": q,
+                                }
+
+                    # optional filter by account_id
                     aid = args.get("account_id")
                     out = []
-                    for h in hits:
-                        payload = h.get("payload") or {}
-                        if aid and payload.get("accountId") != aid:
+                    for rid, h in merged.items():
+                        if aid and (h["payload"] or {}).get("accountId") != aid:
                             continue
-                        out.append({
-                            "score": h.get("score"),
-                            "text": h.get("text"),
-                            "payload": payload,
-                        })
-                    res = {"hits": out, "trace": {"k": k, "query": q, "filtered_by_account": bool(aid)}}
+                        out.append(h)
 
-            if cap == "list_over_threshold":
+                    out.sort(key=lambda x: x["score"], reverse=True)
+                    res = {"hits": out[:k],
+                           "trace": {"k": k, "query": q_raw, "alternates": alts, "filtered_by_account": bool(aid)}}
+
+            elif cap == "list_over_threshold":
                 thr = float(args.get("threshold", 0))
                 res = txn_calc.list_over_threshold(txns, args.get("account_id"), thr, args.get("period"))
             elif cap == "last_transaction":
