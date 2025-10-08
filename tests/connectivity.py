@@ -2,7 +2,7 @@ import openai, os
 
 from core.llm.providers import OpenAIChat
 
-openai.api_key = "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"
+openai.api_key = "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"
 openai.api_base = "https://api.openai.com/v1"
 
 

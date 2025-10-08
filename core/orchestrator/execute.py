@@ -10,7 +10,7 @@ from domains.transactions import calculator as txn_calc
 from domains.payments import calculator as pay_calc
 from domains.statements import calculator as stmt_calc
 from domains.account_summary import calculator as acct_calc
-from core.retrieval.policy_index import get_policy_snippet
+from core.retrieval.knowledge_index import get_policy_snippet
 from core.index.faiss_registry import query_index, Embedder
 
 def _read_app_cfg(app_yaml_path: str) -> dict:

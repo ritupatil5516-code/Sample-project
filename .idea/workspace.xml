@@ -5,10 +5,13 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="8995c3af-8f90-402c-86b4-9fc976f7a0d7" name="Changes" comment="changes">
+      <change beforePath="$PROJECT_DIR$/.env" beforeDir="false" afterPath="$PROJECT_DIR$/.env" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/orchestrator/compose.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/compose.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/context/packs/core.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/core/context/packs/core.yaml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/index/startup.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/index/startup.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/core/orchestrator/execute.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/execute.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/orchestrator/plan_llm.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/plan_llm.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/retrieval/policy_faiss.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/retrieval/knowledge_faiss.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/retrieval/policy_index.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/retrieval/knowledge_index.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -45,21 +48,25 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "Python.connectivity.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "main",
-    "last_opened_file_path": "/Users/ritupatil/PycharmProjects/COPilotDemo1/data/agreement",
-    "run.code.analysis.last.selected.profile": "aDefault"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python.connectivity.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/Users/ritupatil/PycharmProjects/COPilotDemo1/data/agreement&quot;,
+    &quot;run.code.analysis.last.selected.profile&quot;: &quot;aDefault&quot;
   }
-}]]></component>
+}</component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="$PROJECT_DIR$/data/agreement" />
       <recent name="$PROJECT_DIR$" />
+    </key>
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/data/agreement" />
+      <recent name="$PROJECT_DIR$/data/knowledge" />
     </key>
   </component>
   <component name="RunManager">
