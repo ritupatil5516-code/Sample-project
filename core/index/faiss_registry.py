@@ -11,93 +11,123 @@ import numpy as np
 
 try:
     import faiss  # pip install faiss-cpu
-except Exception as e:  # pragma: no cover
-    raise RuntimeError(
-        "FAISS is required. Install with: pip install faiss-cpu"
-    ) from e
+except Exception as e:
+    raise RuntimeError("FAISS is required. Install with: pip install faiss-cpu") from e
 
-# We use REST so we don't force the 'openai' Python SDK dependency.
-import httpx
+# --- Primary embedding backend: LlamaIndex (same tech stack as other embeddings) ---
+#     We use the OpenAIEmbedding class which supports base_url/api_key via env.
+#     If llama_index is missing, we fall back to a simple HTTP REST client.
+_LLAMA_OK = False
+try:
+    from llama_index.embeddings.openai import OpenAIEmbedding  # llama-index>=0.10
+    _LLAMA_OK = True
+except Exception:
+    _LLAMA_OK = False
+
+import httpx  # fallback only
 
 
 # =============================================================================
-# Embedding client (OpenAI-compatible; easily swappable to Qwen later)
+# Unified Embedder (LlamaIndex first; HTTP REST fallback)
 # =============================================================================
 
 class Embedder:
     """
-    Minimal HTTP client for embeddings.
+    Unifies embeddings behind one interface.
+    Prefers LlamaIndex's OpenAIEmbedding (same tech as other embeddings in the app).
+    Falls back to HTTP REST (OpenAI-compatible) if llama_index is not installed.
 
-    Defaults:
-      provider = "openai"
-      api_base = env OPENAI_API_BASE or "https://api.openai.com/v1"
-      api_key  = env OPENAI_API_KEY
-      model    = "text-embedding-3-large"
+    Config mapping (from config['embeddings']):
+      provider:  "openai" (default) | "qwen" (OpenAI-compatible)
+      openai_base_url / qwen_base_url
+      openai_model    / qwen_model
+      openai_api_key_env (default OPENAI_API_KEY)
+      qwen_api_key_env   (default QWEN_API_KEY)
     """
 
     def __init__(
-            self,
-            provider: str = "openai",
-            model: str = "text-embedding-3-large",
-            api_key: Optional[str] = None,
-            api_base: Optional[str] = None,
-            timeout: float = 30.0,
-            batch_size: int = 64,
+        self,
+        provider: str = "openai",
+        model: str = "text-embedding-3-large",
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        timeout: float = 30.0,
+        batch_size: int = 64,
     ) -> None:
         self.provider = (provider or "openai").lower()
         self.model = model or "text-embedding-3-large"
-
-        # Strip and fail fast
-        k = (api_key or os.getenv("OPENAI_API_KEY") or "").strip()
-        if not k:
-            raise RuntimeError("Missing embedding API key. Set OPENAI_API_KEY or pass api_key=...")
-        self.api_key = k
-
-        base = (api_base or os.getenv("OPENAI_API_BASE") or "https://api.openai.com/v1").strip()
-        if base and not (base.startswith("http://") or base.startswith("https://")):
-            base = "https://" + base
-        self.api_base = base.rstrip("/")
-
         self.timeout = float(timeout)
         self.batch_size = int(batch_size)
+
+        # Key + base
+        if self.provider == "qwen":
+            # OpenAI-compatible (DashScope compatible-mode)
+            env_key = (api_key or os.getenv("QWEN_API_KEY") or "").strip()
+            base = (api_base or os.getenv("QWEN_API_BASE") or "https://dashscope.aliyuncs.com/compatible-mode/v1").strip()
+        else:
+            env_key = (api_key or os.getenv("OPENAI_API_KEY") or "").strip()
+            base = (api_base or os.getenv("OPENAI_API_BASE") or "https://api.openai.com/v1").strip()
+
+        if not env_key:
+            raise RuntimeError("Missing embedding API key. Set OPENAI_API_KEY (or QWEN_API_KEY) or pass api_key=...")
+
+        if base and not (base.startswith("http://") or base.startswith("https://")):
+            base = "https://" + base
+        self.api_key = env_key
+        self.api_base = base.rstrip("/")
+
+        # Prepare LlamaIndex embedding backend if available
+        self._li_embed: Optional[OpenAIEmbedding] = None
+        if _LLAMA_OK:
+            # LlamaIndex reads OpenAI settings from env variables:
+            #  - OPENAI_API_KEY
+            #  - OPENAI_API_BASE (if using a compatible endpoint)
+            # Set the right envs for either provider.
+            if self.provider == "qwen":
+                os.environ["OPENAI_API_KEY"] = self.api_key
+                os.environ["OPENAI_API_BASE"] = self.api_base
+            else:
+                os.environ["OPENAI_API_KEY"] = self.api_key
+                os.environ["OPENAI_API_BASE"] = self.api_base
+
+            try:
+                self._li_embed = OpenAIEmbedding(model=self.model)
+            except Exception:
+                self._li_embed = None  # fallback to REST
 
     # ---- public --------------------------------------------------------------
 
     def embed(self, texts: List[str]) -> np.ndarray:
-        """
-        Embed a list of texts and return an (N, D) float32 matrix.
-        Automatically normalizes (L2) for cosine similarity with IndexFlatIP.
-        """
         if not texts:
-            return np.zeros((0, 1536), dtype="float32")
+            return np.zeros((0, self.dim_guess()), dtype="float32")
 
-        # Batch to avoid request size limits
-        vecs: List[List[float]] = []
-        for i in range(0, len(texts), self.batch_size):
-            chunk = texts[i : i + self.batch_size]
-            vecs.extend(self._embed_batch(chunk))
+        # Prefer LlamaIndex backend
+        if self._li_embed is not None:
+            vecs = self._embed_llama_index(texts)
+        else:
+            vecs = []
+            for i in range(0, len(texts), self.batch_size):
+                chunk = texts[i : i + self.batch_size]
+                vecs.extend(self._embed_rest(chunk))
 
         arr = np.array(vecs, dtype="float32")
-        # L2 normalize -> cosine similarity with inner product
-        faiss.normalize_L2(arr)
+        faiss.normalize_L2(arr)  # cosine via inner product
         return arr
 
     def embed_one(self, text: str) -> np.ndarray:
         out = self.embed([text])
         return out[0] if out.shape[0] else np.zeros((self.dim_guess(),), dtype="float32")
 
-    # ---- internals -----------------------------------------------------------
+    # ---- backends ------------------------------------------------------------
 
-    def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        if self.provider == "openai":
-            return self._embed_openai(texts)
-        # You can add elif self.provider == "qwen" later, calling your Qwen endpoint.
-        raise NotImplementedError(f"Unsupported provider: {self.provider}")
+    def _embed_llama_index(self, texts: List[str]) -> List[List[float]]:
+        # LlamaIndex returns Python lists of floats already
+        return self._li_embed.get_text_embedding_batch(texts)  # type: ignore
 
-    def _embed_openai(self, texts: List[str]) -> List[List[float]]:
+    def _embed_rest(self, texts: List[str]) -> List[List[float]]:
+        # OpenAI-compatible REST
         url = f"{self.api_base}/embeddings"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        print("[EMBED DEBUG]", {"base": self.api_base, "model": self.model, "key_present": bool(self.api_key)})
         payload = {"model": self.model, "input": texts}
         with httpx.Client(timeout=self.timeout) as client:
             r = client.post(url, headers=headers, json=payload)
@@ -107,85 +137,85 @@ class Embedder:
 
     @staticmethod
     def dim_guess() -> int:
-        # Common dims; this is only used if we need a placeholder vector.
-        return 3072  # text-embedding-3-large is 3072 dims
+        # text-embedding-3-large = 3072; safe default
+        return 3072
 
 
 # =============================================================================
-# IO helpers
+# Helper to build embedder from config
+# =============================================================================
+
+def build_embedder_from_config(cfg: Dict[str, Any]) -> Embedder:
+    emb_cfg = cfg.get("embeddings", {}) or {}
+    provider = (emb_cfg.get("provider") or "openai").strip().lower()
+
+    if provider == "qwen":
+        base = (emb_cfg.get("qwen_base_url") or "https://dashscope.aliyuncs.com/compatible-mode/v1").strip()
+        model = (emb_cfg.get("qwen_model") or "qwen3-embedding").strip()
+        key_env = (emb_cfg.get("qwen_api_key_env") or "QWEN_API_KEY").strip()
+    else:
+        base = (emb_cfg.get("openai_base_url") or "https://api.openai.com/v1").strip()
+        model = (emb_cfg.get("openai_model") or "text-embedding-3-large").strip()
+        key_env = (emb_cfg.get("openai_api_key_env") or "OPENAI_API_KEY").strip()
+
+    api_key = (os.getenv(key_env) or "").strip()
+    if not api_key:
+        raise RuntimeError(f"[faiss_registry] Missing embedding API key. Set env var {key_env}")
+
+    return Embedder(provider=provider, model=model, api_key=api_key, api_base=base)
+
+
+# =============================================================================
+# IO helpers (unchanged)
 # =============================================================================
 
 def _read_json_objects(path: Path) -> List[Dict[str, Any]]:
-    """
-    Accepts:
-      - JSON array file
-      - JSONL file (one object per line)
-      - JSON object with top-level list under keys like 'data', 'items', 'transactions'
-    Returns a list[dict].
-    """
     if not path.exists():
         return []
-
-    with path.open("r", encoding="utf-8") as f:
-        raw = f.read().strip()
-
+    raw = path.read_text(encoding="utf-8").strip()
     if not raw:
         return []
-
     try:
         data = json.loads(raw)
     except Exception:
-        # Try JSONL
-        objs = []
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                objs.append(json.loads(line))
-        return objs
+        # JSONL fallback
+        out = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s:
+                out.append(json.loads(s))
+        return out
 
     if isinstance(data, list):
         return data
-
     if isinstance(data, dict):
         for k in ("data", "items", "transactions", "rows"):
             v = data.get(k)
             if isinstance(v, list):
                 return v
-        # Single row dict
         return [data]
-
     return []
 
 
 def _read_text_or_pdf(path: Path) -> str:
-    """
-    Reads .md/.txt as text; extracts PDF with PyPDF2 if installed.
-    On failure, returns empty string.
-    """
     if not path.exists():
         return ""
-
     if path.suffix.lower() == ".pdf":
         try:
-            from PyPDF2 import PdfReader  # pip install pypdf2
+            from PyPDF2 import PdfReader
         except Exception:
             return ""
         try:
+            pages = []
             reader = PdfReader(str(path))
-            parts = []
-            for page in reader.pages:
+            for p in reader.pages:
                 try:
-                    parts.append(page.extract_text() or "")
+                    pages.append(p.extract_text() or "")
                 except Exception:
-                    parts.append("")
-            text = "\n".join(parts)
-            return " ".join(text.split())
+                    pages.append("")
+            return " ".join("\n".join(pages).split())
         except Exception:
             return ""
-
-    # default text read
     try:
         return path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
@@ -193,10 +223,7 @@ def _read_text_or_pdf(path: Path) -> str:
 
 
 def _default_row_text(row: Dict[str, Any]) -> str:
-    """
-    Fallback text function that flattens a JSON object into a compact string.
-    """
-    pieces = []
+    parts = []
     for k, v in row.items():
         if isinstance(v, (dict, list)):
             try:
@@ -205,19 +232,16 @@ def _default_row_text(row: Dict[str, Any]) -> str:
                 v_str = str(v)
         else:
             v_str = str(v)
-        pieces.append(f"{k}={v_str}")
-    return " | ".join(pieces)
+        parts.append(f"{k}={v_str}")
+    return " | ".join(parts)
 
 
 def _chunk_text(t: str, max_chars: int = 1500, overlap: int = 150) -> List[str]:
     t = " ".join((t or "").split())
     if not t:
         return []
-    out = []
-    i = 0
-    step = max_chars - overlap
-    if step <= 0:
-        step = max_chars
+    out, i = [], 0
+    step = max_chars - overlap if (max_chars - overlap) > 0 else max_chars
     while i < len(t):
         out.append(t[i : i + max_chars])
         i += step
@@ -225,7 +249,7 @@ def _chunk_text(t: str, max_chars: int = 1500, overlap: int = 150) -> List[str]:
 
 
 # =============================================================================
-# On-disk index layout helpers
+# On-disk index layout helpers (unchanged)
 # =============================================================================
 
 def _paths(index_dir: str, domain: str) -> Dict[str, Path]:
@@ -254,32 +278,24 @@ def _read_rows_jsonl(path: Path) -> List[Dict[str, Any]]:
     out = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if line:
+            s = line.strip()
+            if s:
                 try:
-                    out.append(json.loads(line))
+                    out.append(json.loads(s))
                 except Exception:
-                    out.append({"_raw": line})
+                    out.append({"_raw": s})
     return out
 
 
 # =============================================================================
-# Index builders
+# Index builders (unchanged except they use the new Embedder)
 # =============================================================================
 
 def _build_faiss(vectors: np.ndarray, metric: str = "ip") -> faiss.Index:
-    """
-    Build a FAISS index for given vectors.
-    metric: "ip" (inner product; use with normalized vectors = cosine) or "l2"
-    """
     if vectors.ndim != 2:
         raise ValueError("vectors must be a 2D array (N, D)")
-
-    n, d = vectors.shape
-    if metric == "l2":
-        index = faiss.IndexFlatL2(d)
-    else:
-        index = faiss.IndexFlatIP(d)
+    _, d = vectors.shape
+    index = faiss.IndexFlatL2(d) if metric == "l2" else faiss.IndexFlatIP(d)
     index.add(vectors)
     return index
 
@@ -292,14 +308,6 @@ def index_json_file(
     text_fn: Optional[Callable[[Dict[str, Any]], str]] = None,
     metric: str = "ip",
 ) -> Dict[str, Any]:
-    """
-    Index a JSON array / JSONL of objects (rows) for semantic search.
-    Stores:
-      - {domain}.index       : FAISS index
-      - {domain}_meta.json   : metadata
-      - {domain}_rows.jsonl  : source rows (payloads)
-      - {domain}_texts.jsonl : text used for embeddings (parallel order)
-    """
     p = Path(path)
     rows = _read_json_objects(p)
     if not rows:
@@ -309,8 +317,7 @@ def index_json_file(
     texts = [text_fn(r) for r in rows]
 
     emb = embedder or Embedder()
-    vecs = emb.embed(texts)  # normalized
-
+    vecs = emb.embed(texts)
     index = _build_faiss(vecs, metric=metric)
 
     ps = _paths(index_dir, domain)
@@ -342,14 +349,6 @@ def index_text_file(
     max_chars: int = 1500,
     overlap: int = 150,
 ) -> Dict[str, Any]:
-    """
-    Index a text/markdown/PDF file by chunking into passage texts.
-    Stores:
-      - {domain}.index
-      - {domain}_meta.json
-      - {domain}_rows.jsonl  : {"chunk": i, "offset": start_char}
-      - {domain}_texts.jsonl : {"text": "..."}
-    """
     p = Path(path)
     text = _read_text_or_pdf(p)
     if not text.strip():
@@ -357,17 +356,14 @@ def index_text_file(
 
     chunks = _chunk_text(text, max_chars=max_chars, overlap=overlap)
     rows = [{"chunk": i, "offset": i * (max_chars - overlap)} for i in range(len(chunks))]
-    texts = chunks
-
     emb = embedder or Embedder()
-    vecs = emb.embed(texts)
-
+    vecs = emb.embed(chunks)
     index = _build_faiss(vecs, metric=metric)
 
     ps = _paths(index_dir, domain)
     faiss.write_index(index, str(ps["index"]))
     _write_rows_jsonl(ps["rows"], rows)
-    _write_rows_jsonl(ps["texts"], [{"text": t} for t in texts])
+    _write_rows_jsonl(ps["texts"], [{"text": t} for t in chunks])
 
     meta = {
         "domain": domain,
@@ -386,7 +382,7 @@ def index_text_file(
 
 
 # =============================================================================
-# Query helpers
+# Query helpers (unchanged)
 # =============================================================================
 
 def _load_index(domain: str, index_dir: str = "var/indexes") -> Tuple[faiss.Index, Dict[str, Any], List[Dict[str, Any]], List[str]]:
@@ -414,46 +410,31 @@ def query_index(
     index_dir: str = "var/indexes",
     embedder: Optional[Embedder] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Query a domain index with a natural-language string.
-    Returns a list of {score, text, payload, idx}.
-    Score is inner-product on normalized vectors => cosine similarity in [0, 1].
-    """
     index, meta, rows, texts = _load_index(domain, index_dir)
     emb = embedder or Embedder()
     qv = emb.embed_one(query).reshape(1, -1)
-    D, I = index.search(qv, min(top_k, len(texts)))
-    scores = D[0]
-    idxs = I[0]
-
+    k = min(max(1, top_k), len(texts))
+    D, I = index.search(qv, k)
     out: List[Dict[str, Any]] = []
-    for s, i in zip(scores, idxs):
-        if i < 0 or i >= len(texts):
-            continue
-        out.append({
-            "score": float(s),
-            "text": texts[i],
-            "payload": rows[i] if i < len(rows) else {},
-            "idx": int(i),
-            "meta": meta,
-        })
+    for s, i in zip(D[0], I[0]):
+        if 0 <= i < len(texts):
+            out.append({
+                "score": float(s),
+                "text": texts[i],
+                "payload": rows[i] if i < len(rows) else {},
+                "idx": int(i),
+                "meta": meta,
+            })
     return out
 
 
 # =============================================================================
-# Optional: small registry class used by startup.py (semantic + json)
+# Convenience registry
 # =============================================================================
 
 class FaissRegistry:
-    """
-    Small convenience wrapper used by startup.py and anywhere else you want to
-    manage multiple domain indexes with a consistent API.
-    """
-
     def __init__(self, index_dir: str = "var/indexes") -> None:
         self.index_dir = index_dir
-
-    # --- ensure / (re)build ---------------------------------------------------
 
     def ensure(
         self,
@@ -465,17 +446,12 @@ class FaissRegistry:
         rebuild: bool = False,
         is_text_chunks: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Ensure an index exists. If 'rebuild=True', forces a rebuild.
-        If is_text_chunks=True, expects rows_or_chunks like [{"text": "..."}].
-        """
         ps = _paths(self.index_dir, domain)
         if (not rebuild) and ps["index"].exists() and ps["meta"].exists():
-            # Already exists, return meta
             try:
                 return json.loads(ps["meta"].read_text(encoding="utf-8"))
             except Exception:
-                pass  # fall-through to rebuild
+                pass
 
         if is_text_chunks:
             texts = [d.get("text", "") for d in rows_or_chunks]
@@ -503,8 +479,6 @@ class FaissRegistry:
         }
         ps["meta"].write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return meta
-
-    # --- query ----------------------------------------------------------------
 
     def search(self, domain: str, query: str, k: int, embedder: Optional[Embedder] = None) -> List[Dict[str, Any]]:
         return query_index(domain=domain, query=query, top_k=k, index_dir=self.index_dir, embedder=embedder)
