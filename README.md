@@ -4,7 +4,7 @@
 - LLM (reasoning): OpenAI `gpt-4o-mini` (pluggable to Llama 70B)
 - Embeddings: OpenAI `text-embedding-3-large` (pluggable to Qwen3)
 - Run modes: Streamlit UI + FastAPI
-- Policy PDF path: `data/agreement/Apple-Card-Customer-Agreement.pdf` (add yourself)
+- Policy PDF path: `data/agreement/Agreement.pdf` (add yourself)
 
 ## Quickstart
 ```bash
