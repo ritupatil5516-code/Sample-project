@@ -1,7 +1,9 @@
+import json
 import os
 from typing import Dict, Any, List
 import yaml
 
+from core.retrieval.policy_index import get_policy_snippet
 from domains.transactions.loader import load_transactions
 from domains.payments.loader import load_payments
 from domains.statements.loader import load_statements
@@ -10,7 +12,6 @@ from domains.transactions import calculator as txn_calc
 from domains.payments import calculator as pay_calc
 from domains.statements import calculator as stmt_calc
 from domains.account_summary import calculator as acct_calc
-from core.retrieval.knowledge_index import get_policy_snippet
 from core.index.faiss_registry import query_index, Embedder
 
 def _read_app_cfg(app_yaml_path: str) -> dict:
@@ -134,6 +135,36 @@ def _txn_semantic_search(txns, args, index_dir, embedder):
         out.append(h)
     out.sort(key=lambda x: x["score"], reverse=True)
     return {"hits": out[:k], "trace": {"k": k, "query": q_raw, "alternates": alts, "filtered_by_account": bool(aid)}}
+
+def sanitize_response(answer) -> str:
+    """Guardrail to prevent hallucinations or irrelevant replies."""
+    # Handle dict or non-string types gracefully
+    if isinstance(answer, dict):
+        try:
+            # if it's a structured LLM output, extract message content or text
+            answer = answer.get("content") or answer.get("text") or json.dumps(answer)
+        except Exception:
+            answer = str(answer)
+    elif not isinstance(answer, str):
+        answer = str(answer)
+
+    answer = answer.strip()
+
+    if not answer:
+        return "I don’t know."
+
+    banned_keywords = [
+        "dream", "philosophy", "aliens", "random", "horoscope",
+        "astrology", "feelings", "fiction", "imagination"
+    ]
+
+    if any(k in answer.lower() for k in banned_keywords):
+        return "I can only answer finance-related questions."
+
+    if any(k in answer.lower() for k in ["unknown", "no data", "not found"]):
+        return "No information found."
+
+    return answer
 
 def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
     txns = load_transactions("data/folder/transactions.json")

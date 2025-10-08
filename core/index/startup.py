@@ -104,7 +104,7 @@ def build_on_startup(config_path="config/app.yaml") -> Dict[str, Any]:
     agreement = Path("data/agreement/Apple-Card-Customer-Agreement.pdf")
     sources = [p.as_posix() for p in [handbook, agreement] if p.exists()]
     if sources:
-        meta = ensure_knowledge_index(sources=sources, config_path=config_path, embedder=embedder)
+        meta = ensure_knowledge_index("data/knowledge")
         print(f"[OK] Knowledge index built from {meta.get('count')} text chunks.")
     else:
         print("[WARN] No knowledge sources found; skipping knowledge index")
