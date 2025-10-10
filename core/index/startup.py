@@ -1,4 +1,3 @@
-# core/index/startup.py
 """
 Startup index builder.
 
@@ -23,16 +22,17 @@ from core.index.temporal_registry import ensure_temporal_from_json
 from core.retrieval.knowledge_faiss import ensure_knowledge_index
 
 
-# ------------------------------
-# Path resolution (no parents[])
-# ------------------------------
+# --------------------------------------------
+# Path Resolution Helpers (CWD-proof, no parents[])
+# --------------------------------------------
 
 def _resolve_index_dir() -> Path:
     """
+    Where FAISS indexes are stored.
     Priority:
       1) COPILOT_INDEX_DIR (env)
-      2) ./var/indexes (if folder exists)
-      3) /tmp/copilot_indexes (AWS/container-safe fallback)
+      2) ./var/indexes (if exists)
+      3) /tmp/copilot_indexes (fallback)
     """
     env_val = os.getenv("COPILOT_INDEX_DIR")
     if env_val:
@@ -49,13 +49,13 @@ def _resolve_index_dir() -> Path:
 
 def _resolve_data_dir() -> Path:
     """
-    Where your static JSON files live.
+    Where JSON files live.
     Priority:
       1) COPILOT_DATA_DIR (env)
-      2) ./data/folder (your current layout)
-      3) ./data        (common alternative)
-      4) /app/data     (typical in containers)
-      5) /tmp/copilot_data (last-resort, created)
+      2) ./data/folder
+      3) ./data
+      4) /app/data
+      5) /tmp/copilot_data (fallback)
     """
     candidates: List[str] = [
         os.getenv("COPILOT_DATA_DIR", "").strip(),
@@ -65,14 +65,12 @@ def _resolve_data_dir() -> Path:
         "/tmp/copilot_data",
     ]
     for c in candidates:
-        if not c:
-            continue
-        p = Path(c).resolve()
-        if p.exists():
-            # ensure exists & return
+        if c and Path(c).exists():
+            p = Path(c).resolve()
             p.mkdir(parents=True, exist_ok=True)
             return p
-    # Fallback create
+
+    # Fallback (create temp dir)
     p = Path("/tmp/copilot_data").resolve()
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -155,10 +153,14 @@ def _domain_specs(data_dir: Path) -> Tuple[Dict[str, Path], list[tuple[str, Path
     return sem, temporal
 
 
+# --------------------------------------------
+# Main entry point
+# --------------------------------------------
+
 def build_on_startup(config_path="config/app.yaml") -> Dict[str, Any]:
     print("[INIT] Starting index build…")
 
-    # Resolve paths first (CWD-proof)
+    # Resolve paths first
     index_dir = _resolve_index_dir()
     data_dir = _resolve_data_dir()
     _log_paths(index_dir, data_dir)
@@ -166,7 +168,8 @@ def build_on_startup(config_path="config/app.yaml") -> Dict[str, Any]:
     # Config & flags
     cfg = _read_app_cfg(config_path)
     idx_cfg = cfg.get("indexes") or {}
-    # Allow config to override index_dir if explicitly set there
+
+    # Allow config to override index_dir
     index_dir_cfg = (idx_cfg.get("dir") or "").strip()
     if index_dir_cfg:
         index_dir = Path(index_dir_cfg).resolve()
@@ -182,7 +185,7 @@ def build_on_startup(config_path="config/app.yaml") -> Dict[str, Any]:
     embedder = _build_embedder_from_cfg(cfg)
     print(f"[INIT] Embedder => provider={embedder.provider}, model={embedder.model}")
 
-    # If indexes already built and rebuild is false, skip heavy work
+    # Skip rebuild if already done
     if ready_marker.exists() and not rebuild:
         print(f"[INIT] Indexes already present at {index_dir}; skipping rebuild.")
         return {"index_dir": str(index_dir), "sources": []}
@@ -209,8 +212,6 @@ def build_on_startup(config_path="config/app.yaml") -> Dict[str, Any]:
         print(f"[OK] Built temporal index for {domain}")
 
     # 3️⃣ Knowledge Index
-    # Default layout: data/knowledge + data/agreement (relative to repo)
-    # Also try within data_dir if users placed files alongside JSONs.
     sources: list[str] = []
     candidates = [
         Path("data/knowledge/handbook.md"),
@@ -223,8 +224,6 @@ def build_on_startup(config_path="config/app.yaml") -> Dict[str, Any]:
             sources.append(cp.as_posix())
 
     if sources:
-        # Your existing API expects a directory root; keep consistent with your current call
-        # If your function signature differs, adjust here.
         meta = ensure_knowledge_index("data/knowledge" if Path("data/knowledge").exists() else str(data_dir / "knowledge"))
         count = meta.get("count") if isinstance(meta, dict) else "?"
         print(f"[OK] Knowledge index built. chunks={count}")
