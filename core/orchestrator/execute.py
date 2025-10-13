@@ -24,6 +24,51 @@ from core.retrieval.rag_chain import (
     account_rag_answer,     # account JSONs only (optional)
     knowledge_rag_answer,   # knowledge only (optional)
 )
+def _normalize_calls(calls: Any) -> List[Dict[str, Any]]:
+    """
+    Coerce plan['calls'] into a list[dict] with keys:
+      - domain_id
+      - capability
+      - args (dict)
+    Accepts items that are strings (JSON or op-name), dicts with alternate keys, etc.
+    Silently drops unparseable items.
+    """
+    if calls is None:
+        return []
+    if isinstance(calls, dict):
+        calls = [calls]
+    out: List[Dict[str, Any]] = []
+    for i, c in enumerate(calls):
+        # Allow raw strings: JSON, or a bare op like "unified_answer"
+        if isinstance(c, str):
+            s = c.strip()
+            if not s:
+                continue
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    c = json.loads(s)
+                except Exception:
+                    continue
+            else:
+                # assume a rag op; default domain to 'rag'
+                c = {"domain_id": "rag", "capability": s, "args": {}}
+
+        if not isinstance(c, dict):
+            continue
+
+        # Tolerate alternate key names from planner
+        dom = c.get("domain_id") or c.get("domain") or c.get("domain_key") or ""
+        cap = c.get("capability") or c.get("op") or c.get("operation") or c.get("action") or ""
+        args = c.get("args") or c.get("params") or {}
+
+        # Final shape
+        c = {
+            "domain_id": str(dom).strip().lower().replace("-", "_"),
+            "capability": str(cap).strip().lower().replace("-", "_"),
+            "args": args if isinstance(args, dict) else {}
+        }
+        out.append(c)
+    return out
 
 # ----------------- helpers -----------------
 def _within_period(txn: Dict[str, Any], period: str | None) -> bool:
@@ -219,7 +264,7 @@ def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str,
       - session_id: conversation id for memory
     """
     results: Dict[str, Any] = {}
-
+    calls = _normalize_calls(calls)
     # config for embeddings / FAISS
     app_yaml = (cfg or {}).get("app_yaml") or "config/app.yaml"
     app_cfg = _read_app_cfg(app_yaml)
