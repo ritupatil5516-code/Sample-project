@@ -45,3 +45,11 @@ if __name__ == "__main__":
     )
     ans = compose_answer(question, plan, results)
     print(ans)
+
+from core.retrieval.index_builder import build_all_indexes
+
+if __name__ == "__main__":
+    print("[BOOT] Building all indexes…")
+    build_all_indexes()
+    print("[BOOT] Index build complete. Starting server…")
+    # start your app (streamlit/fastapi/etc.)

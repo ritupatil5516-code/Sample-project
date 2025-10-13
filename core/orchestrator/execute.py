@@ -301,36 +301,35 @@ def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str,
 
         # --------- RAG lane ---------------------------------------------------
         if dom == "rag":
+            session_id = (config_paths or {}).get("session_id") or "default"
+            question = (args.get("query") or args.get("q") or (config_paths or {}).get("question") or "").strip()
+            k = int(args.get("k", 6))
+            account_id = args.get("account_id") or (config_paths or {}).get("account_id")
+
             try:
-                if cap in {"unified_answer", "account_answer"}:
-                    ds = _ensure_datasets(account_id) if account_id else {
-                        "transactions": [], "payments": [], "statements": [], "account_summary": {}
-                    }
-                    knowledge_paths = [
-                        "data/knowledge/handbook.md",
-                        "data/agreement/Apple-Card-Customer-Agreement.pdf",
-                    ]
-                    res = unified_rag_answer(
-                        question=question or args.get("question", ""),
-                        session_id=session_id,
-                        account_id=account_id or "default",
-                        txns=ds["transactions"], pays=ds["payments"],
-                        stmts=ds["statements"],  acct=ds["account_summary"],
-                        knowledge_paths=knowledge_paths,
-                        top_k=int(args.get("k", 5))
-                    )
-                elif cap == "knowledge_answer":
-                    res = knowledge_rag_answer(
-                        question=question or args.get("question", ""),
-                        session_id=session_id,
-                        k=int(args.get("k", 5))
-                    )
+                if cap in ("unified_answer", "unified"):
+                    if not account_id:
+                        res = {"error": "account_id is required for rag.unified_answer"}
+                    else:
+                        res = unified_rag_answer(question=question, session_id=session_id, account_id=account_id, k=k)
+
+                elif cap in ("account_answer", "account_only"):
+                    if not account_id:
+                        res = {"error": "account_id is required for rag.account_answer"}
+                    else:
+                        res = account_rag_answer(question=question, session_id=session_id, account_id=account_id, k=k)
+
+                elif cap in ("knowledge_answer", "policy_answer", "handbook_answer"):
+                    res = knowledge_rag_answer(question=question, session_id=session_id, k=k)
+
                 else:
                     res = {"error": f"Unknown rag capability '{cap}'"}
+
+            except FileNotFoundError as e:
+                # typically: index missing because startup build wasn’t run or wrong path
+                res = {"error": f"Index not found: {e}"}
             except Exception as e:
-                res = {"error": f"RAG failure: {e}"}
-            results[key] = res
-            continue
+                res = {"error": f"RAG execution error: {e}"}
 
         # --------- Generic 5-op DSL (works for any domain) --------------------
         if cap in {"get_field", "find_latest", "sum_where", "topk_by_sum", "list_where", "semantic_search"}:
