@@ -8,77 +8,72 @@ from pathlib import Path
 import httpx
 import yaml
 
+# Optional context packs / routing hints (keep your existing modules)
 from core.context.builder import build_context
 from core.context.hints import build_hint_for_question
 
-import os, httpx, yaml, json, traceback
+# -----------------------------------------------------------------------------
+# Config helpers
+# -----------------------------------------------------------------------------
 
-from core.orchestrator.intent_examples import INTENT_EXAMPLES
-
-cfg = yaml.safe_load(open("config/app.yaml").read())
-key_env = (cfg.get("llm", {}).get("api_key_env") or "OPENAI_API_KEY").strip()
-key = (os.getenv(key_env) or "").strip()
-base = (cfg.get("llm", {}).get("base_url") or "https://api.openai.com/v1").strip()
-
-print("[PLANNER DEBUG] base_url =", base)
-print("[PLANNER DEBUG] key_env =", key_env, "present?" , bool(key))
-# ------------------------------ config helpers --------------------------------
-
-def _coerce_chat_messages(msgs):
+def _read_app_cfg() -> Dict[str, Any]:
     """
-    Ensure every message has str content (or a valid OpenAI content array).
-    - dict content with 'content' str -> keep
-    - dict content without 'content' -> json.dumps
-    - None -> drop the message
-    - list content (already an array-of-parts) -> keep as-is
+    Reads config/app.yaml if present. Returns {} on any error.
     """
-    out = []
-    for i, m in enumerate(msgs or []):
+    p = Path("config/app.yaml")
+    if not p.exists():
+        return {}
+    try:
+        return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+def _coerce_chat_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Ensure every message has a valid OpenAI-compatible 'content' value:
+    - str -> keep
+    - list (array-of-parts) -> keep
+    - dict with 'content' -> unwrap if it's a str; else JSON-serialize
+    - None -> drop
+    - everything else -> str(...)
+    """
+    out: List[Dict[str, Any]] = []
+    for m in msgs or []:
         if not isinstance(m, dict):
             continue
-        role = m.get("role")
+        role = m.get("role", "system")
         content = m.get("content")
         if content is None:
-            # drop empty messages
             continue
         if isinstance(content, str):
             out.append({"role": role, "content": content})
-            continue
-        if isinstance(content, list):
-            # Assume it's already OpenAI "array of parts" format
+        elif isinstance(content, list):
             out.append({"role": role, "content": content})
-            continue
-        if isinstance(content, dict):
-            # If nested dict with 'content' str, unwrap; else JSON-serialize
+        elif isinstance(content, dict):
             inner = content.get("content") if "content" in content else None
             if isinstance(inner, str):
                 out.append({"role": role, "content": inner})
             else:
                 out.append({"role": role, "content": json.dumps(content, ensure_ascii=False)})
-            continue
-        # Fallback: stringify anything else
-        out.append({"role": role, "content": str(content)})
+        else:
+            out.append({"role": role, "content": str(content)})
     return out
 
-def _read_app_cfg() -> Dict[str, Any]:
-    cfg_path = Path("config/app.yaml")
-    if not cfg_path.exists():
-        return {}
-    try:
-        return yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return {}
-
-
-# ------------------------------- LLM wrapper ----------------------------------
+# -----------------------------------------------------------------------------
+# Minimal HTTP client (works with OpenAI-compatible APIs)
+# -----------------------------------------------------------------------------
 
 class _LLMClient:
-    def __init__(self, api_base, api_key, model):
+    def __init__(self, api_base: str, api_key: str, model: str):
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.model = model
 
-    def complete(self, messages, model=None, temperature=0):
+    def complete(self, messages: List[Dict[str, Any]], *, model: Optional[str] = None, temperature: float = 0.0) -> str:
+        """
+        Calls /chat/completions. Returns assistant message content (str).
+        Raises with server error text for quick diagnosis in dev.
+        """
         url = f"{self.api_base}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {
@@ -89,99 +84,166 @@ class _LLMClient:
         try:
             with httpx.Client(timeout=30.0) as client:
                 r = client.post(url, headers=headers, json=payload)
-                # If failure, print server response to see *why*
                 if r.status_code >= 400:
+                    # Print raw text so you see the exact server error in logs
                     print("[LLM ERROR]", r.status_code, r.text)
                 r.raise_for_status()
                 data = r.json()
                 return data["choices"][0]["message"]["content"]
         except httpx.HTTPStatusError as e:
-            # Surface the API error text to Streamlit to diagnose quickly
-            raise RuntimeError(f"OpenAI 400: {e.response.text}") from e
-
-
+            raise RuntimeError(f"Planner LLM error: {e.response.text}") from e
 
 def build_llm_from_config(cfg: Dict[str, Any]) -> _LLMClient:
-    import os
+    """
+    Builds the LLM client from config/app.yaml.
+    Supports OpenAI-compatible endpoints.
+    """
     llm_cfg = (cfg.get("llm") or {})
-
-    api_base = llm_cfg.get("api_base") or llm_cfg.get("base_url") or "https://api.openai.com/v1"
-    # Prefer explicit api_key, else read from env specified by api_key_env
-    api_key = (llm_cfg.get("api_key") or
-               os.getenv(llm_cfg.get("api_key_env", ""), "") or
-               llm_cfg.get("key") or "")
-    model   = llm_cfg.get("model") or "gpt-4o-mini"
-
-    api_base = api_base.strip()
+    api_base = (llm_cfg.get("api_base") or llm_cfg.get("base_url") or "https://api.openai.com/v1").strip()
     if api_base and not (api_base.startswith("http://") or api_base.startswith("https://")):
         api_base = "https://" + api_base
+    api_key = (llm_cfg.get("api_key") or
+               (llm_cfg.get("api_key_env") and os.getenv(llm_cfg.get("api_key_env"), "")) or
+               llm_cfg.get("key") or "")
+    model = (llm_cfg.get("model") or "gpt-4o-mini").strip()
 
     api_key = (api_key or "").strip()
     if not api_key:
-        raise RuntimeError(
-            "Missing LLM API key. Set llm.api_key in config/app.yaml or export the env var named by llm.api_key_env."
-        )
+        raise RuntimeError("Missing LLM API key. Set llm.api_key or llm.api_key_env in config/app.yaml.")
 
     return _LLMClient(api_base=api_base, api_key=api_key, model=model)
-# ------------------------------ Planning prompt -------------------------------
+
+# -----------------------------------------------------------------------------
+# Field map (helps the planner emit account_summary.get_field)
+# -----------------------------------------------------------------------------
+
+ACCOUNT_SUMMARY_FIELDS: Dict[str, List[str]] = {
+    "accountStatus": ["status", "account status", "state", "account_state"],
+    "currentBalance": ["current balance", "balance", "statementBalance", "currentAdjustedBalance"],
+    "availableCreditAmount": ["available credit", "availableCredit", "available credit amount"],
+    "creditLimit": ["credit limit"],
+    "minimumDueAmount": ["minimum due", "minimum payment due"],
+    "paymentDueDate": ["due date", "payment due date", "next due date"],
+    "accountNumberLast4": ["last 4", "last4", "account last 4"],
+}
+
+# -----------------------------------------------------------------------------
+# Contract + Examples
+# -----------------------------------------------------------------------------
 
 SYSTEM_CONTRACT = (
-  "You are the planner for a credit-card copilot.\n"
-  "Output STRICT JSON with this schema:\n"
-  "{\n"
-  "  intent: string,\n"
-  "  ops: [\n"
-  "    { op: 'get_field'|'find_latest'|'sum_where'|'topk_by_sum'|'list_where'|'semantic_search',\n"
-  "      domain: 'account_summary'|'statements'|'payments'|'transactions',\n"
-  "      args: object }\n"
-  "  ],\n"
-  "  must_produce:[],\n"
-  "  risk_if_missing:[]\n"
-  "}\n"
+  "You are a planner for a credit-card copilot. "
+  "Given a user question, output STRICT JSON only: "
+  "{intent: string, calls: [{domain_id, capability, args}], must_produce:[], risk_if_missing:[]}.\n"
+  "Domains/capabilities:\n"
+  "- transactions: {last_transaction, top_merchants, average_per_month, spend_in_period, "
+  "  list_over_threshold, purchases_in_cycle, semantic_search, find_by_merchant}\n"
+  "- payments: {last_payment, total_credited_year, payments_in_period}\n"
+  "- statements: {total_interest, interest_breakdown, trailing_interest}\n"
+  "- account_summary: {current_balance, available_credit, get_field}\n"
   "Guidance:\n"
-  "- Direct fields (e.g., account status, available credit) -> get_field(domain, key_path).\n"
-  "- Latest questions (e.g., last statement closing date, latest interest charged) -> find_latest(domain, ts_field, value_path[, where]).\n"
-  "- Totals (e.g., total posted purchase spend) -> sum_where(domain, value_path, where).\n"
-  "- Top-K (e.g., top merchants by spend) -> topk_by_sum(domain, group_key, value_path, where, k).\n"
-  "- Listings (e.g., list posted purchases over $X, find purchases at <merchant>) -> list_where(domain, where, sort_by, desc, limit).\n"
-  "- Fuzzy concept search (e.g., 'travel purchases') -> semantic_search(domain, query, k).\n"
-  "Use these schema hints:\n"
-  "account_summary: accountStatus, highestPriorityStatus, flags[], subStatuses[], currentBalance, availableCreditAmount, minimumDueAmount, paymentDueAmount, openedDate, closedDate.\n"
-  "statements: closingDateTime, openingDateTime, dueDateTime, dueDate, interestCharged, feesCharged, period.\n"
-  "payments: paymentDateTime, paymentPostedDateTime, amount.\n"
-  "transactions: transactionDateTime, postedDateTime, amount, merchantName, transactionType, displayTransactionType, transactionStatus.\n"
-  "Return ONLY JSON."
+  "- If the user asks for a literal field or clear synonym in account profile "
+  "  (e.g., 'account status', 'credit limit', 'due date'), use account_summary.get_field "
+  "  with args.key_path set to the CANONICAL camelCase key (e.g., 'accountStatus', 'creditLimit', 'paymentDueDate').\n"
+  "- If the user asks for last/latest/recent interest or omits period, set args.period = null; "
+  "  if they say 'last interest' or 'most recent interest charged', also set args.nonzero = true.\n"
+  "- 'Where did I spend the most ...' -> transactions.top_merchants (add args.period if time frame is given; e.g., 'LAST_12M').\n"
+  "- 'Did I buy anything from <merchant>?' -> transactions.find_by_merchant with args.merchant_query='<merchant>'.\n"
+  "- Use transactions.semantic_search for fuzzy concepts (e.g., args.query='travel purchases').\n"
+  "Return ONLY JSON, no commentary."
 )
 
-# A few tiny patterns so the model learns tool selection quickly.
-EXAMPLES = INTENT_EXAMPLES
+# You can keep examples in this file or import them if you created a separate module.
+try:
+    from core.orchestrator.intent_examples import EXAMPLES as _EXTERNAL_EXAMPLES  # optional
+    EXAMPLES: List[Dict[str, Any]] = _EXTERNAL_EXAMPLES
+except Exception:
+    EXAMPLES = [
+        # Essentials (keep it small; the contract already does heavy lifting)
+        {
+            "intent": "get_current_balance",
+            "calls": [{"domain_id": "account_summary", "capability": "current_balance", "args": {}}],
+            "must_produce": [], "risk_if_missing": []
+        },
+        {
+            "intent": "account_status",
+            "calls": [{"domain_id": "account_summary", "capability": "get_field", "args": {"key_path": "accountStatus"}}],
+            "must_produce": [], "risk_if_missing": []
+        },
+        {
+            "intent": "credit_limit",
+            "calls": [{"domain_id": "account_summary", "capability": "get_field", "args": {"key_path": "creditLimit"}}],
+            "must_produce": [], "risk_if_missing": []
+        },
+        {
+            "intent": "due_date",
+            "calls": [{"domain_id": "account_summary", "capability": "get_field", "args": {"key_path": "paymentDueDate"}}],
+            "must_produce": [], "risk_if_missing": []
+        },
+        {
+            "intent": "last_transaction",
+            "calls": [{"domain_id": "transactions", "capability": "last_transaction", "args": {}}],
+            "must_produce": [], "risk_if_missing": []
+        },
+        {
+            "intent": "top_merchants_last_year",
+            "calls": [{"domain_id": "transactions", "capability": "top_merchants", "args": {"period": "LAST_12M"}}],
+            "must_produce": [], "risk_if_missing": []
+        },
+        {
+            "intent": "why_interest",
+            "calls": [
+                {"domain_id": "statements", "capability": "total_interest",     "args": {"period": None, "nonzero": True}},
+                {"domain_id": "statements", "capability": "interest_breakdown", "args": {"period": None, "nonzero": True}},
+                {"domain_id": "statements", "capability": "trailing_interest",  "args": {"period": None}}
+            ],
+            "must_produce": [], "risk_if_missing": []
+        },
+    ]
 
 def _examples_block() -> str:
-    # One compact string the model can see in the prompt
+    """Flatten EXAMPLES to a compact JSON-lines block so the LLM can learn patterns quickly."""
     return "\n".join(json.dumps(e, separators=(",", ":")) for e in EXAMPLES)
 
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
 
-# --------------------------------- Public API ---------------------------------
+import os
 
 def llm_plan(question: str) -> Dict[str, Any]:
     """
-    Build a plan by calling the LLM with context packs + routing hints + contract.
+    Build a plan by calling the LLM with:
+      - context packs (planner mode)
+      - routing hint (optional)
+      - field map (so it can choose get_field)
+      - system contract + lightweight examples
     Returns a dict with defaults if parsing fails.
     """
     cfg = _read_app_cfg()
     llm = build_llm_from_config(cfg)
 
-    # contextual system packs (planner mode)
+    # Contextual system packs (planner mode)
     ctx = build_context(intent="planner", question=question, plan=None)
 
-    # tiny routing hint (optional, only when pattern matches)
+    # Optional routing hint for quick tool selection
     hint = build_hint_for_question(question)
     hint_msg = [{"role": "system", "content": hint}] if hint else []
 
-    messages: List[Dict[str, str]] = (
-        [{"role": "system", "content": ctx["system"]}]
-        + ctx.get("context_msgs", [])
+    # Teach the model your canonical keys + synonyms (helps it pick get_field)
+    field_help = {
+        "domain": "account_summary",
+        "canonical_keys": list(ACCOUNT_SUMMARY_FIELDS.keys()),
+        "synonyms": ACCOUNT_SUMMARY_FIELDS,
+    }
+    field_help_msg = [{"role": "system", "content": f"Field map: {json.dumps(field_help)}"}]
+
+    # Messages
+    messages: List[Dict[str, Any]] = (
+        [{"role": "system", "content": ctx.get("system", "")}]
+        + (ctx.get("context_msgs") or [])
         + hint_msg
+        + field_help_msg
         + [{"role": "system", "content": SYSTEM_CONTRACT}]
         + [{
             "role": "user",
@@ -192,12 +254,12 @@ def llm_plan(question: str) -> Dict[str, Any]:
             )
         }]
     )
-
     messages = _coerce_chat_messages(messages)
 
+    # Call LLM
     raw = llm.complete(messages, model=(cfg.get("llm") or {}).get("model"), temperature=0)
 
-    # Strip to the outermost JSON object if the model wrapped it in text
+    # Extract the outermost JSON if the model wrapped it in text
     start = raw.find("{"); end = raw.rfind("}")
     if start >= 0 and end >= 0 and end > start:
         raw = raw[start:end + 1]
@@ -205,10 +267,10 @@ def llm_plan(question: str) -> Dict[str, Any]:
     try:
         obj = json.loads(raw)
     except Exception:
-        # Last-resort default
+        # Fallback default
         return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": []}
 
-    # Safety: fill defaults and ensure args objects exist
+    # Normalize
     if not isinstance(obj, dict):
         return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": []}
 
