@@ -13,6 +13,8 @@ from core.context.hints import build_hint_for_question
 
 import os, httpx, yaml, json, traceback
 
+from core.orchestrator.intent_examples import INTENT_EXAMPLES
+
 cfg = yaml.safe_load(open("config/app.yaml").read())
 key_env = (cfg.get("llm", {}).get("api_key_env") or "OPENAI_API_KEY").strip()
 key = (os.getenv(key_env) or "").strip()
@@ -124,71 +126,35 @@ def build_llm_from_config(cfg: Dict[str, Any]) -> _LLMClient:
 # ------------------------------ Planning prompt -------------------------------
 
 SYSTEM_CONTRACT = (
-  "You are a planner for a credit-card copilot. "
-  "Given a user question, output STRICT JSON: "
-  "{intent: string, calls: [{domain_id, capability, args}], must_produce:[], risk_if_missing:[]}. "
-  "Domains/capabilities: "
-  "transactions:{last_transaction, top_merchants, average_per_month, spend_in_period, list_over_threshold, purchases_in_cycle, semantic_search, find_by_merchant}; "
-  "payments:{last_payment, total_credited_year, payments_in_period}; "
-  "statements:{total_interest, interest_breakdown, trailing_interest}; "
-  "account_summary:{current_balance, available_credit}. "
-  "If the user asks for last/latest/recent interest or omits period, set args.period = null. "
-  "If they say 'last interest' or 'most recent interest charged', also set args.nonzero = true. "
-  "Mapping rules: "
-  "'Where did I spend the most ...' -> transactions.top_merchants (add args.period when a time frame is mentioned; e.g., 'LAST_12M'). "
-  "'Did I buy anything from <merchant>?' -> transactions.find_by_merchant with args.merchant_query='<merchant>' (case-insensitive). "
-  "Use transactions.semantic_search for fuzzy concepts (e.g., args.query='travel purchases'). "
-  "For brand- or keyword-specific queries (e.g., 'Did I buy anything related to Apple?'), use transactions.semantic_search with args.query and args.alternates, and ALSO setargs.must_include to a lowercase list of the key brand/keyword tokens (e.g., ['apple'])."
-  " The alternates are LLM-generated related terms (brand variants, synonyms, related merchant phrases). Do not invent numbers; this is only for retrieval."
+  "You are the planner for a credit-card copilot.\n"
+  "Output STRICT JSON with this schema:\n"
+  "{\n"
+  "  intent: string,\n"
+  "  ops: [\n"
+  "    { op: 'get_field'|'find_latest'|'sum_where'|'topk_by_sum'|'list_where'|'semantic_search',\n"
+  "      domain: 'account_summary'|'statements'|'payments'|'transactions',\n"
+  "      args: object }\n"
+  "  ],\n"
+  "  must_produce:[],\n"
+  "  risk_if_missing:[]\n"
+  "}\n"
+  "Guidance:\n"
+  "- Direct fields (e.g., account status, available credit) -> get_field(domain, key_path).\n"
+  "- Latest questions (e.g., last statement closing date, latest interest charged) -> find_latest(domain, ts_field, value_path[, where]).\n"
+  "- Totals (e.g., total posted purchase spend) -> sum_where(domain, value_path, where).\n"
+  "- Top-K (e.g., top merchants by spend) -> topk_by_sum(domain, group_key, value_path, where, k).\n"
+  "- Listings (e.g., list posted purchases over $X, find purchases at <merchant>) -> list_where(domain, where, sort_by, desc, limit).\n"
+  "- Fuzzy concept search (e.g., 'travel purchases') -> semantic_search(domain, query, k).\n"
+  "Use these schema hints:\n"
+  "account_summary: accountStatus, highestPriorityStatus, flags[], subStatuses[], currentBalance, availableCreditAmount, minimumDueAmount, paymentDueAmount, openedDate, closedDate.\n"
+  "statements: closingDateTime, openingDateTime, dueDateTime, dueDate, interestCharged, feesCharged, period.\n"
+  "payments: paymentDateTime, paymentPostedDateTime, amount.\n"
+  "transactions: transactionDateTime, postedDateTime, amount, merchantName, transactionType, displayTransactionType, transactionStatus.\n"
   "Return ONLY JSON."
 )
 
 # A few tiny patterns so the model learns tool selection quickly.
-EXAMPLES: List[Dict[str, Any]] = [
-    {
-        "intent": "last_transaction",
-        "calls": [
-            {"domain_id": "transactions", "capability": "last_transaction", "args": {}}
-        ],
-        "must_produce": [],
-        "risk_if_missing": []
-    },
-    {
-        "intent": "get_current_balance",
-        "calls": [
-            {"domain_id": "account_summary", "capability": "current_balance", "args": {}}
-        ],
-        "must_produce": [],
-        "risk_if_missing": []
-    },
-    {
-        "intent": "why_interest",
-        "calls": [
-            {"domain_id": "statements",  "capability": "total_interest",      "args": {"period": None, "nonzero": True}},
-            {"domain_id": "statements",  "capability": "interest_breakdown",  "args": {"period": None, "nonzero": True}},
-            {"domain_id": "statements",  "capability": "trailing_interest",   "args": {"period": None}}
-        ],
-        "must_produce": [],
-        "risk_if_missing": []
-    },
-    {
-        "intent": "spend_in_period",
-        "calls": [
-            {"domain_id": "transactions", "capability": "spend_in_period", "args": {"period": "2025-04"}}
-        ],
-        "must_produce": [],
-        "risk_if_missing": []
-    },
-    {
-        "intent": "average_per_month",
-        "calls": [
-            {"domain_id": "transactions", "capability": "average_per_month", "args": {"period": "2025"}}
-        ],
-        "must_produce": [],
-        "risk_if_missing": []
-    },
-]
-
+EXAMPLES = INTENT_EXAMPLES
 
 def _examples_block() -> str:
     # One compact string the model can see in the prompt

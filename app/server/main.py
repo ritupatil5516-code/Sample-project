@@ -13,6 +13,9 @@ class AskReq(BaseModel):
 @app.post("/ask")
 def ask(req: AskReq):
   plan = make_plan(req.question, "config/app.yaml")
-  results = execute_calls(plan.get("calls", []), {"app_yaml":"config/app.yaml","policy_store_dir":"var/policies","intent":plan.get("intent")})
+  results = execute_calls(plan.get("calls", []),
+                          {"app_yaml":"config/app.yaml",
+                           "policy_store_dir":"var/policies",
+                           "intent":plan.get("intent")})
   ans = compose_answer(req.question, plan, results)
   return {"plan": plan, "results": results, "answer": ans}

@@ -5,13 +5,15 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="8995c3af-8f90-402c-86b4-9fc976f7a0d7" name="Changes" comment="changes">
-      <change beforePath="$PROJECT_DIR$/.env" beforeDir="false" afterPath="$PROJECT_DIR$/.env" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/core/orchestrator/intent_examples.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/context/packs/core.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/core/context/packs/core.yaml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/index/startup.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/index/startup.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/server/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/server/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/orchestrator/compose.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/compose.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/core/orchestrator/execute.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/execute.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/retrieval/policy_faiss.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/retrieval/knowledge_faiss.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/core/retrieval/policy_index.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/retrieval/knowledge_index.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/orchestrator/plan_llm.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/plan_llm.py" afterDir="false" />
+    </list>
+    <list id="571996ee-ce96-4316-a5ad-ffa6ec27a835" name="local" comment="local">
+      <change beforePath="$PROJECT_DIR$/.env" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -48,21 +50,21 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;Python.connectivity.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/Users/ritupatil/PycharmProjects/COPilotDemo1/data/agreement&quot;,
-    &quot;run.code.analysis.last.selected.profile&quot;: &quot;aDefault&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.connectivity.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "git-widget-placeholder": "main",
+    "last_opened_file_path": "/Users/ritupatil/PycharmProjects/COPilotDemo1",
+    "run.code.analysis.last.selected.profile": "aDefault"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
-      <recent name="$PROJECT_DIR$/data/agreement" />
       <recent name="$PROJECT_DIR$" />
+      <recent name="$PROJECT_DIR$/data/agreement" />
     </key>
     <key name="MoveFile.RECENT_KEYS">
       <recent name="$PROJECT_DIR$/data/agreement" />
@@ -161,7 +163,47 @@
       <option name="project" value="LOCAL" />
       <updated>1759862118287</updated>
     </task>
-    <option name="localTasksCounter" value="7" />
+    <task id="LOCAL-00007" summary="remove env value">
+      <option name="closed" value="true" />
+      <created>1759955763419</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1759955763419</updated>
+    </task>
+    <task id="LOCAL-00008" summary="full working model">
+      <option name="closed" value="true" />
+      <created>1759965566549</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1759965566549</updated>
+    </task>
+    <task id="LOCAL-00009" summary="full working model">
+      <option name="closed" value="true" />
+      <created>1759966279201</created>
+      <option name="number" value="00009" />
+      <option name="presentableId" value="LOCAL-00009" />
+      <option name="project" value="LOCAL" />
+      <updated>1759966279201</updated>
+    </task>
+    <task id="LOCAL-00010" summary="changes">
+      <option name="closed" value="true" />
+      <created>1760135812801</created>
+      <option name="number" value="00010" />
+      <option name="presentableId" value="LOCAL-00010" />
+      <option name="project" value="LOCAL" />
+      <updated>1760135812801</updated>
+    </task>
+    <task id="LOCAL-00011" summary="changes">
+      <option name="closed" value="true" />
+      <created>1760137463196</created>
+      <option name="number" value="00011" />
+      <option name="presentableId" value="LOCAL-00011" />
+      <option name="project" value="LOCAL" />
+      <updated>1760137463196</updated>
+    </task>
+    <option name="localTasksCounter" value="12" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -180,6 +222,8 @@
     <MESSAGE value="workingmodel" />
     <MESSAGE value="one with some errors" />
     <MESSAGE value="Working model" />
+    <MESSAGE value="remove env value" />
+    <MESSAGE value="full working model" />
     <MESSAGE value="changes" />
     <option name="LAST_COMMIT_MESSAGE" value="changes" />
   </component>

@@ -1,22 +1,32 @@
-import json
-import os
-from typing import Dict, Any, List
-import yaml
+# core/orchestrator/execute.py
+from __future__ import annotations
+from typing import Any, Dict, List, Optional
+from datetime import datetime
+import os, json, yaml
+import jmespath  # pip install jmespath
 
-from core.retrieval.policy_index import get_policy_snippet
+# ---- Keep your existing loaders (unchanged) ----
 from domains.transactions.loader import load_transactions
 from domains.payments.loader import load_payments
 from domains.statements.loader import load_statements
 from domains.account_summary.loader import load_account_summary
+
+# (Optional) Old calculator fallback (only used if a legacy call isn't mapped)
 from domains.transactions import calculator as txn_calc
 from domains.payments import calculator as pay_calc
 from domains.statements import calculator as stmt_calc
 from domains.account_summary import calculator as acct_calc
+
+# FAISS semantic search
 from core.index.faiss_registry import query_index, Embedder
 
+
+# =========================
+# Config & embedder
+# =========================
 def _read_app_cfg(app_yaml_path: str) -> dict:
     try:
-        with open(app_yaml_path, "r") as f:
+        with open(app_yaml_path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     except Exception:
         return {}
@@ -30,387 +40,255 @@ def _build_embedder_from_cfg(cfg: dict) -> Embedder:
     api_key = os.getenv(api_key_env, "")
     return Embedder(provider=provider, model=model, api_key=api_key, api_base=api_base)
 
-def _stmt_key(s: dict) -> str:
-    # prefer closingDateTime, else period, else empty
-    return (s.get("closingDateTime") or s.get("period") or "")
 
-def _pick_latest_stmt(stmts: list[dict], nonzero: bool) -> dict | None:
-    if nonzero:
-        cand = [s for s in stmts if (s.get("interestCharged") or 0) > 0]
-    else:
-        cand = stmts
-    if not cand:
-        return None
-    return max(cand, key=_stmt_key)
+# =========================
+# Universal JSON ops (5)
+# =========================
+def _ensure_list(x: Any) -> List[dict]:
+    if isinstance(x, list): return x
+    if isinstance(x, dict): return [x]
+    return []
 
-def _latest_txn_key(t: dict) -> str:
-    return (t.get("transactionDateTime") or t.get("postedDateTime") or t.get("date") or "")
+def _to_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s: return None
+    try: return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except: return None
 
-def _fmt_money(x) -> str:
-    try:
-        return f"${float(x):,.2f}"
-    except Exception:
-        return "$0.00"
+def _get(obj: dict, path: str) -> Any:
+    # JMESPath handles dot paths, arrays, filters, to_string(), contains(), etc.
+    return jmespath.search(path, obj)
 
-def _latest_statement_period_from(stmts: List[dict]):
-    periods = [s.get("period") for s in stmts if isinstance(s, dict) and s.get("period")]
-    return max(periods) if periods else None
+def _op_get_field(rows: List[dict], key_path: str) -> Dict[str, Any]:
+    obj = rows[0] if rows else {}
+    return {"value": _get(obj, key_path)}
 
-def _latest_statement_period_with_interest(stmts: List[dict]):
-    periods = sorted({s.get("period") for s in stmts if s.get("period")}, reverse=True)
-    for p in periods:
-        for s in stmts:
-            if s.get("period") == p:
-                val = float(s.get("interestCharged") or s.get("interest_charged") or 0)
-                if val > 0: return p
-    return None
+def _op_find_latest(rows: List[dict], ts_field: str, value_path: str, where: Optional[str]=None) -> Dict[str, Any]:
+    items = _ensure_list(rows)
+    if where: items = jmespath.search(where, items) or []
+    items = [r for r in items if _to_dt(_get(r, ts_field))]
+    if not items: return {"value": None}
+    items.sort(key=lambda r: _to_dt(_get(r, ts_field)) or datetime.min, reverse=True)
+    return {"value": _get(items[0], value_path), "row": items[0]}
 
-def _read_app_cfg(app_yaml_path: str) -> dict:
-    try:
-        with open(app_yaml_path, "r") as f:
-            return yaml.safe_load(f) or {}
-    except Exception:
-        return {}
+def _op_sum_where(rows: List[dict], value_path: str, where: Optional[str]=None) -> Dict[str, Any]:
+    items = _ensure_list(rows)
+    if where: items = jmespath.search(where, items) or []
+    total = 0.0
+    for r in items:
+        v = _get(r, value_path)
+        try: total += float(v or 0)
+        except: pass
+    return {"total": round(total, 2), "count": len(items)}
 
-def _build_embedder_from_cfg(cfg: dict) -> Embedder:
-    """Builds the FAISS embedder using your embeddings config.
-    (Supports OpenAI today; Qwen can be added later.)"""
-    emb = (cfg.get("embeddings") or {})
-    provider = (emb.get("provider") or "openai").lower()
-    model = emb.get("openai_model") or emb.get("model") or "text-embedding-3-large"
-    # OpenAI base/key via env; Embedder() reads OPENAI_API_KEY/OPENAI_API_BASE by default
-    api_base = emb.get("openai_base_url") or emb.get("api_base") or None
-    api_key_env = emb.get("openai_api_key_env") or "OPENAI_API_KEY"
-    api_key = os.getenv(api_key_env, "")
-    return Embedder(provider=provider, model=model, api_key=api_key, api_base=api_base)
-
-from datetime import datetime, timedelta, timezone
-
-def _within_period(txn, period: str | None) -> bool:
-    if not period:
-        return True
-    # Only implement LAST_12M for now (extend later if you like)
-    if period.upper() == "LAST_12M":
-        ts = (txn.get("transactionDateTime") or txn.get("postedDateTime") or txn.get("date"))
-        if not ts:
-            return False
-        # parse ISO (very tolerant)
+def _op_topk_by_sum(rows: List[dict], group_key: str, value_path: str,
+                    where: Optional[str]=None, k:int=5) -> Dict[str, Any]:
+    items = _ensure_list(rows)
+    if where: items = jmespath.search(where, items) or []
+    agg: Dict[str, float] = {}
+    for r in items:
+        key = _get(r, group_key) or "UNKNOWN"
         try:
-            # handle Z
-            if ts.endswith("Z"):
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            agg[str(key)] = agg.get(str(key), 0.0) + float(_get(r, value_path) or 0)
+        except:
+            pass
+    ranked = sorted(
+        ({"key": k_, "total": round(v, 2)} for k_, v in agg.items()),
+        key=lambda x: x["total"], reverse=True
+    )
+    return {"top": ranked[:max(1, int(k))], "groups": len(agg)}
+
+def _op_list_where(rows: List[dict], where: Optional[str]=None,
+                   sort_by: Optional[str]=None, desc: bool=True, limit:int=20) -> Dict[str, Any]:
+    items = _ensure_list(rows)
+    if where: items = jmespath.search(where, items) or []
+    if sort_by:
+        try: items.sort(key=lambda r: _get(r, sort_by) or "", reverse=bool(desc))
+        except: pass
+    return {"items": items[:max(1, int(limit))], "count": len(items)}
+
+
+# =========================
+# Legacy → 5-op aliases (so your current planner still works)
+# =========================
+_ALIAS: Dict[str, Dict[str, Any]] = {
+    # account_summary
+    "current_balance": {"op":"get_field", "domain":"account_summary", "args":{"key_path":"currentBalance"}},
+    "available_credit":{"op":"get_field", "domain":"account_summary", "args":{"key_path":"availableCreditAmount"}},
+    # statements
+    "total_interest":  {"op":"find_latest","domain":"statements", "args":{"ts_field":"closingDateTime","value_path":"interestCharged"}},
+    # transactions
+    "top_merchants":   {"op":"topk_by_sum","domain":"transactions", "args":{
+        "group_key":"merchantName",
+        "value_path":"amount",
+        "where":"[?transactionStatus=='POSTED' && contains(to_string(displayTransactionType),'PURCHASE') && amount > `0`]",
+        "k":5
+    }},
+    "list_over_threshold":{"op":"list_where","domain":"transactions", "args":{
+        "where":"[?amount >= `THRESH` && transactionStatus=='POSTED']",
+        "sort_by":"postedDateTime","desc":True,"limit":50
+    }},
+    "find_by_merchant":{"op":"list_where","domain":"transactions", "args":{
+        "where":"[?contains(to_string(merchantName), `Q`) && transactionStatus=='POSTED']",
+        "sort_by":"postedDateTime","desc":True,"limit":50
+    }},
+    "spend_in_period": {"op":"sum_where","domain":"transactions", "args":{
+        "value_path":"amount",
+        "where":"[?transactionStatus=='POSTED' && contains(to_string(displayTransactionType),'PURCHASE') && amount > `0`]"
+    }},
+    # passthrough
+    "semantic_search": {"op":"semantic_search", "domain":"transactions", "args":{}},
+}
+
+def _map_calls_to_ops(calls: List[dict]) -> List[dict]:
+    """Turn legacy planner `calls` into generic `ops` via _ALIAS."""
+    ops: List[dict] = []
+    for c in (calls or []):
+        dom = str(c.get("domain_id","")).strip().lower().replace("-","_")
+        cap = str(c.get("capability","")).strip().lower().replace("-","_")
+        args = dict(c.get("args") or {})
+        if cap in _ALIAS:
+            spec = json.loads(json.dumps(_ALIAS[cap]))  # deep copy
+            spec["domain"] = spec.get("domain") or dom
+            # light templating:
+            if "threshold" in args and "where" in spec["args"]:
+                spec["args"]["where"] = spec["args"]["where"].replace("THRESH", str(args["threshold"]))
+            if "merchant_query" in args and "where" in spec["args"]:
+                spec["args"]["where"] = spec["args"]["where"].replace("Q", str(args["merchant_query"]))
+            # caller overrides:
+            for k, v in args.items():
+                spec["args"][k] = v
+            ops.append(spec)
+        else:
+            # soft fallback: if it already *is* one of the 5 ops, just reuse it
+            if cap in {"get_field","find_latest","sum_where","topk_by_sum","list_where","semantic_search"}:
+                ops.append({"op":cap, "domain": dom, "args": args})
             else:
-                dt = datetime.fromisoformat(ts)
-        except Exception:
-            return False
-        cutoff = datetime.now(timezone.utc) - timedelta(days=365)
-        return dt >= cutoff
-    return True
+                # last resort: keep a fallback record so nothing crashes
+                ops.append({"op":"__fallback__", "domain": dom, "capability": cap, "args": args})
+    return ops
 
-# ---------- transactions capability implementations (pure functions) ---------
 
-def _txn_semantic_search(txns, args, index_dir, embedder):
-    from core.index.faiss_registry import query_index
-    q_raw = (args.get("query") or args.get("category") or "").strip()
-    alts = args.get("alternates") or []
-    k = int(args.get("k", 5))
-    if not q_raw:
-        return {"hits": [], "error": "query is required", "trace": {"k": k}}
-    queries = [q_raw] + [a for a in alts if isinstance(a, str) and a.strip()]
-    merged = {}
-    for q in queries[:8]:
-        hits = query_index("transactions", q.strip(), top_k=max(1, k), index_dir=index_dir, embedder=embedder)
-        for h in hits:
-            p = h.get("payload") or {}
-            rid = p.get("transactionId") or h.get("idx")
-            score = float(h.get("score", 0.0))
-            prev = merged.get(rid)
-            if (prev is None) or (score > prev["score"]):
-                merged[rid] = {"score": score, "text": h.get("text"), "payload": p, "matched_query": q}
-    aid = args.get("account_id")
-    out = []
-    for _, h in merged.items():
-        if aid and (h["payload"] or {}).get("accountId") != aid:
-            continue
-        out.append(h)
-    out.sort(key=lambda x: x["score"], reverse=True)
-    return {"hits": out[:k], "trace": {"k": k, "query": q_raw, "alternates": alts, "filtered_by_account": bool(aid)}}
-
-def sanitize_response(answer) -> str:
-    """Guardrail to prevent hallucinations or irrelevant replies."""
-    # Handle dict or non-string types gracefully
-    if isinstance(answer, dict):
-        try:
-            # if it's a structured LLM output, extract message content or text
-            answer = answer.get("content") or answer.get("text") or json.dumps(answer)
-        except Exception:
-            answer = str(answer)
-    elif not isinstance(answer, str):
-        answer = str(answer)
-
-    answer = answer.strip()
-
-    if not answer:
-        return "I don’t know."
-
-    banned_keywords = [
-        "dream", "philosophy", "aliens", "random", "horoscope",
-        "astrology", "feelings", "fiction", "imagination"
-    ]
-
-    if any(k in answer.lower() for k in banned_keywords):
-        return "I can only answer finance-related questions."
-
-    if any(k in answer.lower() for k in ["unknown", "no data", "not found"]):
-        return "No information found."
-
-    return answer
-
+# =========================
+# Public: execute_calls
+# =========================
 def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
+    """
+    Universal executor for the tiny DSL (and legacy calls):
+      - Prefer explicit ops if provided via config_paths["_ops"].
+      - Else map legacy `calls` -> 5 ops using _ALIAS.
+      - Executes one of: get_field, find_latest, sum_where, topk_by_sum, list_where, semantic_search.
+      - If an op is "__fallback__", use your old calculators (compat mode).
+    Returns: dict keyed by "domain.op[index]" with each op's result payload.
+    """
+    # 0) Load data once
     txns = load_transactions("data/folder/transactions.json")
     pays = load_payments("data/folder/payments.json")
     stmts = load_statements("data/folder/statements.json")
     acct  = load_account_summary("data/folder/account_summary.json")
+    acct_rows = acct if isinstance(acct, list) else ([acct] if isinstance(acct, dict) else [])
 
+    dom_rows: Dict[str, List[dict]] = {
+        "transactions": txns,
+        "payments": pays,
+        "statements": stmts,
+        "account_summary": acct_rows,
+    }
+
+    # 1) Config & embedder once
     cfg = _read_app_cfg(config_paths["app_yaml"])
     index_dir = ((cfg.get("indexes") or {}).get("dir")) or "var/indexes"
     embedder = _build_embedder_from_cfg(cfg)
 
+    # 2) Resolve ops: prefer explicit ops; else map calls → ops
+    ops: List[dict] = config_paths.get("_ops") or _map_calls_to_ops(calls)
 
-    results = {}
-    latest_stmt_period = _latest_statement_period_from(stmts)
-    intent = (config_paths or {}).get("intent")
+    # 3) Run
+    out: Dict[str, Any] = {}
+    for i, spec in enumerate(ops):
+        op   = spec.get("op")
+        dom  = (spec.get("domain") or "").strip().lower()
+        args = dict(spec.get("args") or {})
+        key  = f"{dom}.{op}[{i}]"
 
-    for call in calls:
+        rows = dom_rows.get(dom) or []
 
-        # --- normalize + debug -----------------------------------------------
-        dom = str(call.get("domain_id", "")).strip().lower().replace("-", "_")
-        cap = str(call.get("capability", "")).strip().lower().replace("-", "_")
-        args = dict(call.get("args", {}) or {})
-        key = f"{dom}.{cap}"
-        print(f"[EXEC DEBUG] dom={dom} cap={cap} args={args}")
+        if op == "get_field":
+            res = _op_get_field(rows, args["key_path"])
 
+        elif op == "find_latest":
+            res = _op_find_latest(rows, args["ts_field"], args["value_path"], args.get("where"))
 
-        if dom == "transactions":
-            if cap == "semantic_search":
-                # --- SEMANTIC MULTI-QUERY (pure embeddings; no deterministic heuristics) ---
-                q_raw = (args.get("query") or args.get("category") or "").strip()
-                alts = args.get("alternates") or []
-                k = int(args.get("k", 5))
-                if not q_raw:
-                    res = {"hits": [], "error": "query is required", "trace": {"k": k}}
+        elif op == "sum_where":
+            res = _op_sum_where(rows, args["value_path"], args.get("where"))
+
+        elif op == "topk_by_sum":
+            res = _op_topk_by_sum(rows, args["group_key"], args["value_path"], args.get("where"), int(args.get("k", 5)))
+
+        elif op == "list_where":
+            res = _op_list_where(rows, args.get("where"), args.get("sort_by"), bool(args.get("desc", True)), int(args.get("limit", 20)))
+
+        elif op == "semantic_search":
+            q = (args.get("query") or args.get("category") or "").strip()
+            k = int(args.get("k", 5))
+            res = {"hits": query_index(dom, q, top_k=k, index_dir=index_dir, embedder=embedder)} if q else {"hits": [], "error": "query is required"}
+
+        elif op == "__fallback__":
+            # Only invoked if a legacy capability wasn't in _ALIAS.
+            cap = spec.get("capability")
+            if dom == "transactions":
+                if cap == "last_transaction":
+                    last = max(txns, key=lambda t: (t.get("transactionDateTime") or t.get("postedDateTime") or t.get("date") or "")) if txns else None
+                    res = {"item": last, "trace": {"count": len(txns)}}
+                elif cap == "spend_in_period":
+                    res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
+                elif cap == "purchases_in_cycle":
+                    res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
+                elif cap == "max_amount":
+                    res = txn_calc.max_amount(txns, args.get("account_id"), args.get("period"),
+                                              args.get("period_start"), args.get("period_end"),
+                                              args.get("category"), int(args.get("top", 1)))
+                elif cap == "aggregate_by_category":
+                    res = txn_calc.aggregate_by_category(txns, args.get("account_id"),
+                                                         args.get("period"), args.get("period_start"), args.get("period_end"))
+                elif cap == "average_per_month":
+                    res = txn_calc.average_per_month(txns, args.get("account_id"), args.get("period"),
+                                                     args.get("period_start"), args.get("period_end"),
+                                                     bool(args.get("include_credits", False)))
                 else:
-                    # Prepare config + embedder (if you haven’t already done this once per call list)
-                    queries = [q_raw] + [a for a in alts if isinstance(a, str) and a.strip()]
-                    merged = {}
-                    for q in queries[:8]:
-                        hits = query_index(
-                            domain="transactions",
-                            query=q.strip(),
-                            top_k=max(1, k),
-                            index_dir=index_dir,
-                            embedder=embedder,
-                        )
-                        for h in hits:
-                            p = h.get("payload") or {}
-                            rid = p.get("transactionId") or h.get("idx")
-                            score = float(h.get("score", 0.0))
-                            prev = merged.get(rid)
-                            if (prev is None) or (score > prev["score"]):
-                                merged[rid] = {
-                                    "score": score,
-                                    "text": h.get("text"),
-                                    "payload": p,
-                                    "matched_query": q,
-                                }
+                    res = {"error": f"Unknown legacy capability {cap}"}
 
-                    # optional filter by account_id
-                    aid = args.get("account_id")
-                    out = []
-                    for rid, h in merged.items():
-                        if aid and (h["payload"] or {}).get("accountId") != aid:
-                            continue
-                        out.append(h)
-
-                    out.sort(key=lambda x: x["score"], reverse=True)
-                    res = {"hits": out[:k],
-                           "trace": {"k": k, "query": q_raw, "alternates": alts, "filtered_by_account": bool(aid)}}
-
-            elif cap == "list_over_threshold":
-                thr = float(args.get("threshold", 0))
-                res = txn_calc.list_over_threshold(txns, args.get("account_id"), thr, args.get("period"))
-            elif cap == "last_transaction":
-                # optional account filter
-                aid = args.get("account_id")
-                cand = [t for t in txns if (not aid or t.get("accountId") == aid)]
-                if not cand:
-                    res = {"error": "No transactions", "trace": {"count": 0}}
+            elif dom == "payments":
+                if cap == "last_payment":
+                    res = pay_calc.last_payment(pays, args.get("account_id"))
+                elif cap == "total_credited_year":
+                    yr = args.get("year")
+                    res = pay_calc.total_credited_year(pays, args.get("account_id"), int(yr) if yr else None)
+                elif cap == "payments_in_period":
+                    res = pay_calc.payments_in_period(pays, args.get("account_id"), args.get("period"))
                 else:
-                    last = max(cand, key=_latest_txn_key)
-                    res = {"item": last, "trace": {"count": len(cand)}}
+                    res = {"error": f"Unknown legacy capability {cap}"}
 
-
-            elif cap == "top_merchants":
-
-                aid = args.get("account_id")
-
-                period = args.get("period")  # e.g., "LAST_12M"
-
-                cand = [t for t in txns if (not aid or t.get("accountId") == aid)]
-
-                # apply period filter
-
-                cand = [t for t in cand if _within_period(t, period)]
-
-                # purchases only (DEBIT or positive amount)
-
-                rows = [t for t in cand if (t.get("transactionType") == "DEBIT" or (t.get("amount") or 0) > 0)]
-
-                totals = {}
-
-                for t in rows:
-                    m = (t.get("merchantName") or "UNKNOWN").strip()
-
-                    totals[m] = totals.get(m, 0.0) + float(t.get("amount") or 0.0)
-
-                top = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
-
-                res = {
-
-                    "top_merchants": [{"merchant": m, "total": v} for m, v in top],
-
-                    "trace": {"count": len(rows), "period": period or "ALL"}
-
-                }
-            elif cap == "find_by_merchant":
-                # args: merchant_query (required, case-insensitive contains), optional account_id, optional period
-                q = (args.get("merchant_query") or "").strip().lower()
-                if not q:
-                    res = {"error": "merchant_query is required", "trace": {}}
+            elif dom == "statements":
+                if cap == "interest_breakdown":
+                    res = stmt_calc.interest_breakdown(stmts, args.get("account_id"), args.get("period"))
+                elif cap == "trailing_interest":
+                    res = stmt_calc.trailing_interest(stmts, args.get("account_id"), args.get("period"))
                 else:
-                    aid = args.get("account_id")
-                    period = args.get("period")
-                    cand = [t for t in txns if (not aid or t.get("accountId") == aid)]
-                    cand = [t for t in cand if _within_period(t, period)]
-                    hits = []
-                    for t in cand:
-                        m = (t.get("merchantName") or "").lower()
-                        if q in m:
-                            hits.append(t)
-                    # sort newest first
-                    hits.sort(key=_latest_txn_key, reverse=True)
-                    res = {"items": hits, "count": len(hits), "trace": {"merchant_query": q, "period": period or "ALL"}}
+                    res = {"error": f"Unknown legacy capability {cap}"}
 
-            elif cap == "spend_in_period":
-                res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
-            elif cap == "purchases_in_cycle":
-                res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
-            elif cap == "max_amount":
-                res = txn_calc.max_amount(
-                    txns,
-                    args.get("account_id"),
-                    args.get("period"),
-                    args.get("period_start"),
-                    args.get("period_end"),
-                    args.get("category"),
-                    int(args.get("top", 1)),
-                )
-            elif cap == "aggregate_by_category":
-                res = txn_calc.aggregate_by_category(
-                    txns, args.get("account_id"),
-                    args.get("period"),
-                    args.get("period_start"),
-                    args.get("period_end"),
-                )
-            elif cap == "average_per_month":
-                res = txn_calc.average_per_month(
-                    txns,
-                    args.get("account_id"),
-                    args.get("period"),
-                    args.get("period_start"),
-                    args.get("period_end"),
-                    bool(args.get("include_credits", False)),
-                )
-            elif cap == "compare_periods":
-                res = txn_calc.compare_periods(txns, args.get("account_id"), args.get("period1"), args.get("period2"))
+            elif dom == "account_summary":
+                if cap == "current_balance":
+                    res = acct_calc.current_balance(acct)
+                elif cap == "available_credit":
+                    res = acct_calc.available_credit(acct)
+                else:
+                    res = {"error": f"Unknown legacy capability {cap}"}
             else:
-                res = {"error": f"Unknown capability {cap}"}
-
-        elif dom == "payments":
-            if cap == "last_payment":
-                res = pay_calc.last_payment(pays, args.get("account_id"))
-            elif cap == "total_credited_year":
-                yr = args.get("year")
-                res = pay_calc.total_credited_year(pays, args.get("account_id"), int(yr) if yr else None)
-            elif cap == "payments_in_period":
-                res = pay_calc.payments_in_period(pays, args.get("account_id"), args.get("period"))
-            else:
-                res = {"error": f"Unknown capability {cap}"}
-
-        elif dom == "statements":
-
-            # fill missing/NULL period
-            nonzero = bool(args.get("nonzero"))
-            if not args.get("period"):
-                pick = _pick_latest_stmt(stmts, nonzero=nonzero)
-                if pick:
-                    args["period"] = pick.get("period")
-                    args["_picked_close"] = pick.get("closingDateTime")
-                    args["_picked_interest"] = pick.get("interestCharged")
-                else:
-                    args["period"] = None
-
-            if not args.get("period"):
-                if args.get("nonzero") or intent == "last_interest":
-                    args["period"] = _latest_statement_period_with_interest(stmts) or latest_stmt_period
-                else:
-                    args["period"] = latest_stmt_period
-
-            if cap == "total_interest":
-                prd = args.get("period")
-                if prd is None:
-                    res = {"error": "No statements available", "trace": {"period": None}}
-                else:
-                    if args.get("_picked_interest") is not None:
-                        amt = args["_picked_interest"]
-                        res = {"interest_total": amt,
-                               "trace": {"period": prd, "close_date": args.get("_picked_close"), "nonzero": nonzero}}
-                    else:
-                        # find exact period
-                        row = next((s for s in stmts if s.get("period") == prd), None)
-                        if not row:
-                            res = {"error": "No statement for period", "trace": {"period": prd}}
-                        else:
-                            amt = row.get("interestCharged") or 0.0
-                            res = {"interest_total": amt,
-                                   "trace": {"period": prd, "close_date": row.get("closingDateTime"),
-                                             "nonzero": nonzero}}
-            elif cap == "interest_breakdown":
-                res = stmt_calc.interest_breakdown(stmts, args.get("account_id"), args["period"])
-            elif cap == "trailing_interest":
-                res = stmt_calc.trailing_interest(stmts, args.get("account_id"), args["period"])
-            else:
-                res = {"error": f"Unknown capability {cap}"}
-
-            if isinstance(res, dict):
-                tr = res.setdefault("trace", {})
-                if isinstance(tr, dict) and not tr.get("period") and args.get("period"):
-                    tr["period"] = args["period"]
-
-        elif dom == "account_summary":
-            if cap == "current_balance":
-                res = acct_calc.current_balance(acct)
-            elif cap == "available_credit":
-                res = acct_calc.available_credit(acct)
-            else:
-                res = {"error": f"Unknown capability {cap}"}
-
-        elif dom == "policy":
-            res = get_policy_snippet(cap)
+                res = {"error": f"Unknown legacy domain {dom}"}
 
         else:
-            res = {"error": f"Unknown domain {dom}"}
+            res = {"error": f"Unknown op {op}"}
 
-        results[key] = res
+        out[key] = res
 
-    return results
+    return out
