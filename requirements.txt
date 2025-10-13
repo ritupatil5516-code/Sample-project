@@ -1,14 +1,36 @@
+# Web Framework
 streamlit==1.38.0
 fastapi==0.111.0
 uvicorn[standard]==0.30.3
+
+# HTTP & Config
 httpx==0.27.0
+requests==2.32.5
 pyyaml==6.0.1
+python-dotenv==1.1.1
+
+# AI/ML
+openai~=2.3.0
+
+# Vector Search & Embeddings
 faiss-cpu==1.8.0.post1
 numpy==1.26.4
-pydantic==2.8.2
-pypdf==4.3.1
-pypdf2
 
-requests~=2.32.5
-python-dotenv~=1.1.1
-openai~=2.2.0
+# LlamaIndex (CRITICAL - Missing!)
+llama-index==0.10.67
+llama-index-core~=0.14.4
+llama-index-embeddings-openai==0.1.11
+llama-index-vector-stores-faiss==0.1.3
+
+# Data Processing
+jmespath==1.0.1
+
+# PDF Processing (choose ONE)
+pypdf==4.3.1
+
+# Validation
+pydantic==2.8.2
+langchain~=0.3.27
+langchain-openai~=0.3.35
+langchain-community~=0.3.31
+langchain-core~=0.3.79
