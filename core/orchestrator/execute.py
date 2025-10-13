@@ -31,6 +31,7 @@ def _read_app_cfg(app_yaml_path: str) -> dict:
     except Exception:
         return {}
 
+
 def _build_embedder_from_cfg(cfg: dict) -> Embedder:
     emb = (cfg.get("embeddings") or {})
     provider = (emb.get("provider") or "openai").lower()
@@ -49,20 +50,30 @@ def _ensure_list(x: Any) -> List[dict]:
     if isinstance(x, dict): return [x]
     return []
 
+
 def _to_dt(s: Optional[str]) -> Optional[datetime]:
     if not s: return None
-    try: return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except: return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except:
+        return None
+
 
 def _get(obj: dict, path: str) -> Any:
     # JMESPath handles dot paths, arrays, filters, to_string(), contains(), etc.
     return jmespath.search(path, obj)
 
-def _op_get_field(rows: List[dict], key_path: str) -> Dict[str, Any]:
-    obj = rows[0] if rows else {}
-    return {"value": _get(obj, key_path)}
 
-def _op_find_latest(rows: List[dict], ts_field: str, value_path: str, where: Optional[str]=None) -> Dict[str, Any]:
+def _op_get_field(rows: List[dict], key_path: str) -> Dict[str, Any]:
+    """Get a field from the first row (or single object)"""
+    if not rows:
+        return {"value": None, "error": "No data available"}
+    obj = rows[0] if rows else {}
+    value = _get(obj, key_path)
+    return {"value": value}
+
+
+def _op_find_latest(rows: List[dict], ts_field: str, value_path: str, where: Optional[str] = None) -> Dict[str, Any]:
     items = _ensure_list(rows)
     if where: items = jmespath.search(where, items) or []
     items = [r for r in items if _to_dt(_get(r, ts_field))]
@@ -70,18 +81,22 @@ def _op_find_latest(rows: List[dict], ts_field: str, value_path: str, where: Opt
     items.sort(key=lambda r: _to_dt(_get(r, ts_field)) or datetime.min, reverse=True)
     return {"value": _get(items[0], value_path), "row": items[0]}
 
-def _op_sum_where(rows: List[dict], value_path: str, where: Optional[str]=None) -> Dict[str, Any]:
+
+def _op_sum_where(rows: List[dict], value_path: str, where: Optional[str] = None) -> Dict[str, Any]:
     items = _ensure_list(rows)
     if where: items = jmespath.search(where, items) or []
     total = 0.0
     for r in items:
         v = _get(r, value_path)
-        try: total += float(v or 0)
-        except: pass
+        try:
+            total += float(v or 0)
+        except:
+            pass
     return {"total": round(total, 2), "count": len(items)}
 
+
 def _op_topk_by_sum(rows: List[dict], group_key: str, value_path: str,
-                    where: Optional[str]=None, k:int=5) -> Dict[str, Any]:
+                    where: Optional[str] = None, k: int = 5) -> Dict[str, Any]:
     items = _ensure_list(rows)
     if where: items = jmespath.search(where, items) or []
     agg: Dict[str, float] = {}
@@ -97,13 +112,16 @@ def _op_topk_by_sum(rows: List[dict], group_key: str, value_path: str,
     )
     return {"top": ranked[:max(1, int(k))], "groups": len(agg)}
 
-def _op_list_where(rows: List[dict], where: Optional[str]=None,
-                   sort_by: Optional[str]=None, desc: bool=True, limit:int=20) -> Dict[str, Any]:
+
+def _op_list_where(rows: List[dict], where: Optional[str] = None,
+                   sort_by: Optional[str] = None, desc: bool = True, limit: int = 20) -> Dict[str, Any]:
     items = _ensure_list(rows)
     if where: items = jmespath.search(where, items) or []
     if sort_by:
-        try: items.sort(key=lambda r: _get(r, sort_by) or "", reverse=bool(desc))
-        except: pass
+        try:
+            items.sort(key=lambda r: _get(r, sort_by) or "", reverse=bool(desc))
+        except:
+            pass
     return {"items": items[:max(1, int(limit))], "count": len(items)}
 
 
@@ -112,39 +130,41 @@ def _op_list_where(rows: List[dict], where: Optional[str]=None,
 # =========================
 _ALIAS: Dict[str, Dict[str, Any]] = {
     # account_summary
-    "current_balance": {"op":"get_field", "domain":"account_summary", "args":{"key_path":"currentBalance"}},
-    "available_credit":{"op":"get_field", "domain":"account_summary", "args":{"key_path":"availableCreditAmount"}},
+    "current_balance": {"op": "get_field", "domain": "account_summary", "args": {"key_path": "currentBalance"}},
+    "available_credit": {"op": "get_field", "domain": "account_summary", "args": {"key_path": "availableCredit"}},
     # statements
-    "total_interest":  {"op":"find_latest","domain":"statements", "args":{"ts_field":"closingDateTime","value_path":"interestCharged"}},
+    "total_interest": {"op": "find_latest", "domain": "statements",
+                       "args": {"ts_field": "closingDateTime", "value_path": "interestCharged"}},
     # transactions
-    "top_merchants":   {"op":"topk_by_sum","domain":"transactions", "args":{
-        "group_key":"merchantName",
-        "value_path":"amount",
-        "where":"[?transactionStatus=='POSTED' && contains(to_string(displayTransactionType),'PURCHASE') && amount > `0`]",
-        "k":5
+    "top_merchants": {"op": "topk_by_sum", "domain": "transactions", "args": {
+        "group_key": "merchantName",
+        "value_path": "amount",
+        "where": "[?transactionStatus=='POSTED' && contains(to_string(displayTransactionType),'PURCHASE') && amount > `0`]",
+        "k": 5
     }},
-    "list_over_threshold":{"op":"list_where","domain":"transactions", "args":{
-        "where":"[?amount >= `THRESH` && transactionStatus=='POSTED']",
-        "sort_by":"postedDateTime","desc":True,"limit":50
+    "list_over_threshold": {"op": "list_where", "domain": "transactions", "args": {
+        "where": "[?amount >= `THRESH` && transactionStatus=='POSTED']",
+        "sort_by": "postedDateTime", "desc": True, "limit": 50
     }},
-    "find_by_merchant":{"op":"list_where","domain":"transactions", "args":{
-        "where":"[?contains(to_string(merchantName), `Q`) && transactionStatus=='POSTED']",
-        "sort_by":"postedDateTime","desc":True,"limit":50
+    "find_by_merchant": {"op": "list_where", "domain": "transactions", "args": {
+        "where": "[?contains(to_string(merchantName), `Q`) && transactionStatus=='POSTED']",
+        "sort_by": "postedDateTime", "desc": True, "limit": 50
     }},
-    "spend_in_period": {"op":"sum_where","domain":"transactions", "args":{
-        "value_path":"amount",
-        "where":"[?transactionStatus=='POSTED' && contains(to_string(displayTransactionType),'PURCHASE') && amount > `0`]"
+    "spend_in_period": {"op": "sum_where", "domain": "transactions", "args": {
+        "value_path": "amount",
+        "where": "[?transactionStatus=='POSTED' && contains(to_string(displayTransactionType),'PURCHASE') && amount > `0`]"
     }},
     # passthrough
-    "semantic_search": {"op":"semantic_search", "domain":"transactions", "args":{}},
+    "semantic_search": {"op": "semantic_search", "domain": "transactions", "args": {}},
 }
+
 
 def _map_calls_to_ops(calls: List[dict]) -> List[dict]:
     """Turn legacy planner `calls` into generic `ops` via _ALIAS."""
     ops: List[dict] = []
     for c in (calls or []):
-        dom = str(c.get("domain_id","")).strip().lower().replace("-","_")
-        cap = str(c.get("capability","")).strip().lower().replace("-","_")
+        dom = str(c.get("domain_id", "")).strip().lower().replace("-", "_")
+        cap = str(c.get("capability", "")).strip().lower().replace("-", "_")
         args = dict(c.get("args") or {})
         if cap in _ALIAS:
             spec = json.loads(json.dumps(_ALIAS[cap]))  # deep copy
@@ -160,11 +180,11 @@ def _map_calls_to_ops(calls: List[dict]) -> List[dict]:
             ops.append(spec)
         else:
             # soft fallback: if it already *is* one of the 5 ops, just reuse it
-            if cap in {"get_field","find_latest","sum_where","topk_by_sum","list_where","semantic_search"}:
-                ops.append({"op":cap, "domain": dom, "args": args})
+            if cap in {"get_field", "find_latest", "sum_where", "topk_by_sum", "list_where", "semantic_search"}:
+                ops.append({"op": cap, "domain": dom, "args": args})
             else:
                 # last resort: keep a fallback record so nothing crashes
-                ops.append({"op":"__fallback__", "domain": dom, "capability": cap, "args": args})
+                ops.append({"op": "__fallback__", "domain": dom, "capability": cap, "args": args})
     return ops
 
 
@@ -184,8 +204,11 @@ def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
     txns = load_transactions("data/folder/transactions.json")
     pays = load_payments("data/folder/payments.json")
     stmts = load_statements("data/folder/statements.json")
-    acct  = load_account_summary("data/folder/account_summary.json")
-    acct_rows = acct if isinstance(acct, list) else ([acct] if isinstance(acct, dict) else [])
+    acct = load_account_summary("data/folder/account_summary.json")
+
+    # IMPORTANT FIX: account_summary should be a single dict, not a list
+    # Wrap it in a list for consistency with other operations
+    acct_rows = [acct] if isinstance(acct, dict) else (acct if isinstance(acct, list) else [])
 
     dom_rows: Dict[str, List[dict]] = {
         "transactions": txns,
@@ -205,10 +228,10 @@ def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
     # 3) Run
     out: Dict[str, Any] = {}
     for i, spec in enumerate(ops):
-        op   = spec.get("op")
-        dom  = (spec.get("domain") or "").strip().lower()
+        op = spec.get("op")
+        dom = (spec.get("domain") or "").strip().lower()
         args = dict(spec.get("args") or {})
-        key  = f"{dom}.{op}[{i}]"
+        key = f"{dom}.{op}[{i}]"
 
         rows = dom_rows.get(dom) or []
 
@@ -225,19 +248,22 @@ def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
             res = _op_topk_by_sum(rows, args["group_key"], args["value_path"], args.get("where"), int(args.get("k", 5)))
 
         elif op == "list_where":
-            res = _op_list_where(rows, args.get("where"), args.get("sort_by"), bool(args.get("desc", True)), int(args.get("limit", 20)))
+            res = _op_list_where(rows, args.get("where"), args.get("sort_by"), bool(args.get("desc", True)),
+                                 int(args.get("limit", 20)))
 
         elif op == "semantic_search":
             q = (args.get("query") or args.get("category") or "").strip()
             k = int(args.get("k", 5))
-            res = {"hits": query_index(dom, q, top_k=k, index_dir=index_dir, embedder=embedder)} if q else {"hits": [], "error": "query is required"}
+            res = {"hits": query_index(dom, q, top_k=k, index_dir=index_dir, embedder=embedder)} if q else {"hits": [],
+                                                                                                            "error": "query is required"}
 
         elif op == "__fallback__":
             # Only invoked if a legacy capability wasn't in _ALIAS.
             cap = spec.get("capability")
             if dom == "transactions":
                 if cap == "last_transaction":
-                    last = max(txns, key=lambda t: (t.get("transactionDateTime") or t.get("postedDateTime") or t.get("date") or "")) if txns else None
+                    last = max(txns, key=lambda t: (t.get("transactionDateTime") or t.get("postedDateTime") or t.get(
+                        "date") or "")) if txns else None
                     res = {"item": last, "trace": {"count": len(txns)}}
                 elif cap == "spend_in_period":
                     res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
@@ -249,7 +275,8 @@ def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
                                               args.get("category"), int(args.get("top", 1)))
                 elif cap == "aggregate_by_category":
                     res = txn_calc.aggregate_by_category(txns, args.get("account_id"),
-                                                         args.get("period"), args.get("period_start"), args.get("period_end"))
+                                                         args.get("period"), args.get("period_start"),
+                                                         args.get("period_end"))
                 elif cap == "average_per_month":
                     res = txn_calc.average_per_month(txns, args.get("account_id"), args.get("period"),
                                                      args.get("period_start"), args.get("period_end"),
@@ -292,3 +319,26 @@ def execute_calls(calls: List[dict], config_paths: dict) -> Dict[str, Any]:
         out[key] = res
 
     return out
+
+
+def sanitize_response(text: str) -> str:
+    """Remove JSON wrappers if LLM accidentally returns structured output"""
+    if not text:
+        return ""
+
+    # Strip markdown code fences
+    text = text.strip()
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1])
+
+    # If it looks like JSON, try to extract the answer field
+    if text.strip().startswith("{"):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict) and "answer" in obj:
+                return str(obj["answer"])
+        except:
+            pass
+
+    return text
