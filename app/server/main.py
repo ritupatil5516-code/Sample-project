@@ -1,3 +1,4 @@
+import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 from core.orchestrator.planner import make_plan
@@ -13,9 +14,34 @@ class AskReq(BaseModel):
 @app.post("/ask")
 def ask(req: AskReq):
   plan = make_plan(req.question, "config/app.yaml")
-  results = execute_calls(plan.get("calls", []),
-                          {"app_yaml":"config/app.yaml",
-                           "policy_store_dir":"var/policies",
-                           "intent":plan.get("intent")})
+  results = execute_calls(
+      plan.get("calls", []),
+      {
+          "app_yaml": "config/app.yaml",
+          "account_id": req.accountId,
+          "intent": plan.get("intent"),
+          "question": req.question,  # << add
+          "session_id": req.sessionId or "web"  # << add (any stable per-user/thread id)
+      }
+  )
   ans = compose_answer(req.question, plan, results)
   return {"plan": plan, "results": results, "answer": ans}
+
+
+if __name__ == "__main__":
+    question = "when was i last charged interest ?"
+    sessionId=""
+    accountId="0269"
+    plan = make_plan(question, "config/app.yaml")
+    results = execute_calls(
+        plan.get("calls", []),
+        {
+            "app_yaml": "config/app.yaml",
+            "account_id": accountId,
+            "intent": plan.get("intent"),
+            "question": question,  # << add
+            "session_id": sessionId or "web"  # << add (any stable per-user/thread id)
+        }
+    )
+    ans = compose_answer(question, plan, results)
+    print(ans)

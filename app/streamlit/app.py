@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
 # --- Core imports ---
 from core.index.startup import build_on_startup
 from core.orchestrator.planner import make_plan
-from core.orchestrator.execute import execute_calls, sanitize_response
+from core.orchestrator.execute import execute_calls
 from core.orchestrator.compose import compose_answer
 from core.orchestrator.verify import verify
 
@@ -77,7 +77,10 @@ def run_local(question: str):
     ok, missing = verify(plan, results)
 
     composed = compose_answer(question, plan, results)
-    final_text = sanitize_response(composed or "").strip()
+    if isinstance(composed, dict):
+        final_text = composed.get("answer") or composed.get("content") or str(composed)
+    else:
+        final_text = str(composed or "No information found.").strip()
 
     # Handle empty / unknown responses
     if not final_text or final_text.lower() in ["", "none", "null"]:

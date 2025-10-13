@@ -1,429 +1,423 @@
 # core/orchestrator/execute.py
 from __future__ import annotations
-
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone, timedelta
 import json
-import os
+from typing import Any, Dict, List, Tuple
+from datetime import datetime, timedelta, timezone
 
-# ---- domain loaders
+# deterministic loaders / calculators
 from domains.transactions.loader import load_transactions
 from domains.payments.loader import load_payments
 from domains.statements.loader import load_statements
 from domains.account_summary.loader import load_account_summary
 
-# ---- calculators (keep)
 from domains.transactions import calculator as txn_calc
 from domains.payments import calculator as pay_calc
 from domains.statements import calculator as stmt_calc
 from domains.account_summary import calculator as acct_calc
 
-# ---- optional semantic search (if present)
-try:
-    from core.index.faiss_registry import query_index  # type: ignore
-    _FAISS_AVAILABLE = True
-except Exception:
-    _FAISS_AVAILABLE = False
+# vector search for semantic ops (transactions)
+from core.index.faiss_registry import query_index, Embedder
 
-# ---- RAG (LangChain conversational retrieval)
-from core.retrieval.rag_chain import account_rag_answer, knowledge_rag_answer
+# RAG lane with conversational memory
+from core.retrieval.rag_chain import (
+    unified_rag_answer,     # account JSONs + knowledge
+    account_rag_answer,     # account JSONs only (optional)
+    knowledge_rag_answer,   # knowledge only (optional)
+)
 
-# =============================================================================
-# Helpers
-# =============================================================================
-
-def _as_str(x: Any) -> str:
-    return "" if x is None else str(x)
-
-def _to_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-def _to_dt(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-def _txn_ts(t: Dict[str, Any]) -> str:
-    return (
-        t.get("transactionDateTime")
-        or t.get("postedDateTime")
-        or t.get("date")
-        or ""
-    )
-
-def _within_period(txn: Dict[str, Any], period: Optional[str]) -> bool:
+# ----------------- helpers -----------------
+def _within_period(txn: Dict[str, Any], period: str | None) -> bool:
     if not period:
         return True
-    p = period.strip().upper()
-    ts = _to_dt(_txn_ts(txn))
-    if not ts:
-        return False
-    if p == "LAST_12M":
-        return ts >= (datetime.now(timezone.utc) - timedelta(days=365))
-    if len(period) == 7 and period[4] == "-":  # YYYY-MM
-        return ts.strftime("%Y-%m") == period
+    if period.upper() == "LAST_12M":
+        ts = (txn.get("transactionDateTime") or txn.get("postedDateTime") or txn.get("date"))
+        if not ts:
+            return False
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            return False
+        cutoff = datetime.now(timezone.utc) - timedelta(days=365)
+        return dt >= cutoff
     return True
 
-def _pick_account_id(calls: List[dict], cfg: Dict[str, Any]) -> Optional[str]:
-    aid = (cfg or {}).get("account_id")
-    if aid:
-        return str(aid)
-    for c in calls or []:
-        a = c.get("args") or {}
-        if a.get("account_id"):
-            return str(a["account_id"])
+def _get_field_from_row(row: Dict[str, Any], field: str) -> Any:
+    """
+    Supports dot paths and case-insensitive fallback:
+      - "currentBalance"
+      - "persons[0].accountActivity.rewardsEarned"
+    """
+    if not field:
+        return None
+    # try dotted/indexed path
+    try:
+        cur: Any = row
+        for part in field.replace("]", "").split("."):
+            if "[" in part:
+                key, idx = part.split("[", 1)
+                cur = cur.get(key, [])
+                cur = cur[int(idx)]
+            else:
+                cur = cur.get(part)
+            if cur is None:
+                break
+        if cur is not None:
+            return cur
+    except Exception:
+        pass
+    # fallback: case-insensitive leaf scan
+    f_low = field.lower()
+    for k, v in row.items():
+        if k.lower() == f_low:
+            return v
     return None
 
-def _get_nested(d: Any, dotted: str) -> Any:
-    cur = d
-    for part in (dotted or "").split("."):
-        if part == "":
-            continue
-        if isinstance(cur, dict):
-            cur = cur.get(part)
-        else:
-            return None
-    return cur
+def _latest_key(row: Dict[str, Any]) -> str:
+    for k in ("transactionDateTime","postedDateTime","paymentPostedDateTime","paymentDateTime","closingDateTime","openingDateTime","date"):
+        v = row.get(k)
+        if v: return str(v)
+    return ""
 
-def _apply_filters(rows: List[Dict[str, Any]], flt: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if not flt:
-        return rows
-    out = []
+def _read_app_cfg(path: str) -> Dict[str, Any]:
+    import yaml, os
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+def _build_embedder_from_cfg(cfg: Dict[str, Any]) -> Embedder:
+    emb = (cfg.get("embeddings") or {})
+    provider = (emb.get("provider") or "openai").lower()
+    model    = emb.get("openai_model") or emb.get("model") or "text-embedding-3-large"
+    api_base = emb.get("openai_base_url") or emb.get("api_base") or None
+    api_key  = __import__("os").getenv(emb.get("openai_api_key_env") or "OPENAI_API_KEY", "")
+    return Embedder(provider=provider, model=model, api_key=api_key, api_base=api_base)
+
+# --------------- generic 5-op DSL executors -----------------------------------
+def _op_get_field(domain: str, args: Dict[str, Any], datasets: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Works across ANY domain.
+    Args:
+      field: path or leaf key
+      where: optional dict of equality filters (applied when dataset is a list)
+      latest: bool – pick the newest row by timestamp fields
+    """
+    field = (args.get("field") or "").strip()
+    latest = bool(args.get("latest"))
+    where  = args.get("where") or {}
+
+    data = datasets.get(domain)
+    if data is None:
+        return {"error": f"Unknown domain {domain}"}
+
+    if isinstance(data, dict):  # account_summary style
+        return {"value": _get_field_from_row(data, field)}
+
+    rows: List[Dict[str, Any]] = data or []
+    cand = []
     for r in rows:
         ok = True
-        for k, want in flt.items():
-            contains = False
-            if isinstance(k, str) and k.endswith("~"):
-                contains = True
-                k = k[:-1]
-            got = _get_nested(r, k)
-            if contains:
-                ok = (_as_str(want).lower() in _as_str(got).lower())
-            else:
-                ok = (_as_str(got) == _as_str(want))
-            if not ok:
-                break
+        for k, v in where.items():
+            if (r.get(k) != v):
+                ok = False; break
+        if ok:
+            cand.append(r)
+    if not cand:
+        cand = rows
+    if not cand:
+        return {"value": None}
+    row = max(cand, key=_latest_key) if latest else cand[0]
+    return {"value": _get_field_from_row(row, field), "row": row}
+
+def _op_find_latest(domain: str, args: Dict[str, Any], datasets: Dict[str, Any]) -> Dict[str, Any]:
+    data = datasets.get(domain)
+    if isinstance(data, dict):
+        return {"value": data, "row": data}
+    rows = data or []
+    if not rows:
+        return {"value": None}
+    row = max(rows, key=_latest_key)
+    return {"value": row, "row": row}
+
+def _op_sum_where(domain: str, args: Dict[str, Any], datasets: Dict[str, Any]) -> Dict[str, Any]:
+    field = (args.get("field") or "amount").strip()
+    where = args.get("where") or {}
+    rows: List[Dict[str, Any]] = datasets.get(domain) or []
+    total = 0.0; cnt = 0
+    for r in rows:
+        ok = True
+        for k, v in where.items():
+            if r.get(k) != v:
+                ok = False; break
+        if ok:
+            try:
+                total += float(r.get(field) or 0)
+                cnt += 1
+            except Exception:
+                pass
+    return {"total": total, "count": cnt}
+
+def _op_topk_by_sum(domain: str, args: Dict[str, Any], datasets: Dict[str, Any]) -> Dict[str, Any]:
+    group_key = (args.get("group_by") or "merchantName").strip()
+    field = (args.get("field") or "amount").strip()
+    k = int(args.get("k", 5))
+    rows: List[Dict[str, Any]] = datasets.get(domain) or []
+    agg: Dict[str, float] = {}
+    for r in rows:
+        g = (r.get(group_key) or "UNKNOWN")
+        try:
+            agg[g] = agg.get(g, 0.0) + float(r.get(field) or 0)
+        except Exception:
+            pass
+    top = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:k]
+    return {"top": [{"key": a, "total": b} for a, b in top]}
+
+def _op_list_where(domain: str, args: Dict[str, Any], datasets: Dict[str, Any]) -> Dict[str, Any]:
+    where = args.get("where") or {}
+    period = args.get("period")
+    rows: List[Dict[str, Any]] = datasets.get(domain) or []
+    out = []
+    for r in rows:
+        if period and not _within_period(r, period):
+            continue
+        ok = True
+        for k, v in where.items():
+            if r.get(k) != v:
+                ok = False; break
         if ok:
             out.append(r)
-    return out
+    out.sort(key=_latest_key, reverse=True)
+    return {"items": out}
 
-def _sort_rows(rows: List[Dict[str, Any]], sort_by: Optional[str], order: str) -> List[Dict[str, Any]]:
-    if not sort_by:
-        return rows
-    rev = (order or "desc").lower().startswith("d")
-    return sorted(rows, key=lambda r: (_get_nested(r, sort_by) is None, _get_nested(r, sort_by)), reverse=rev)
+def _op_semantic_search_transactions(args: Dict[str, Any], index_dir: str, embedder: Embedder) -> Dict[str, Any]:
+    q_raw = (args.get("query") or args.get("category") or "").strip()
+    alts = [a for a in (args.get("alternates") or []) if isinstance(a, str) and a.strip()]
+    k = int(args.get("k", 5))
+    if not q_raw:
+        return {"hits": [], "error": "query is required", "trace": {"k": k}}
+    merged: Dict[str, Dict[str, Any]] = {}
+    for q in [q_raw] + alts[:7]:
+        for h in query_index("transactions", q, top_k=max(1, k), index_dir=index_dir, embedder=embedder):
+            p = h.get("payload") or {}
+            rid = p.get("transactionId") or h.get("idx")
+            score = float(h.get("score", 0.0))
+            prev = merged.get(rid)
+            if (prev is None) or (score > prev["score"]):
+                merged[rid] = {"score": score, "text": h.get("text"), "payload": p, "matched_query": q}
+    hits = list(merged.values())
+    hits.sort(key=lambda x: x["score"], reverse=True)
+    return {"hits": hits[:k], "trace": {"k": k, "query": q_raw, "alternates": alts}}
 
-def _project_values(rows: List[Dict[str, Any]], key_path: str) -> List[Any]:
-    return [_get_nested(r, key_path) for r in rows]
-
-def _aggregate(values: List[Any], agg: Optional[str]) -> Any:
-    if not agg:
-        return values
-    a = (agg or "").lower()
-    if not values:
-        return None if a in ("first", "last", "max", "min", "avg", "sum") else 0
-    if a == "first": return values[0]
-    if a == "last":  return values[-1]
-    if a == "max":
-        try: return max(values)
-        except Exception: return None
-    if a == "min":
-        try: return min(values)
-        except Exception: return None
-    if a == "sum": return sum(_to_float(v, 0.0) for v in values)
-    if a == "avg":
-        nums = [_to_float(v, 0.0) for v in values]
-        return (sum(nums) / len(nums)) if nums else 0.0
-    if a == "count": return len(values)
-    if a == "unique":
-        try:
-            # JSON-string unique; lightweight
-            return list({json.dumps(v, sort_keys=True) for v in values})
-        except Exception:
-            return list({str(v) for v in values})
-    return values
-
-FIELD_ALIASES: Dict[str, List[str]] = {
-    "accountStatus": ["status", "account status", "state", "account_state"],
-    "currentBalance": ["current balance", "balance", "statementBalance", "currentAdjustedBalance"],
-    "availableCreditAmount": ["available credit", "availableCredit", "available credit amount"],
-    "creditLimit": ["credit limit"],
-    "minimumDueAmount": ["minimum due", "minimum payment due"],
-    "paymentDueDate": ["due date", "payment due date", "next due date"],
-    "accountNumberLast4": ["last 4", "last4", "account last 4"],
-}
-
-def _get_field_with_alias(obj: Dict[str, Any], key: str) -> Any:
-    if key in obj: return obj[key]
-    low = key.lower()
-    if low in obj: return obj[low]
-    for canonical, alts in FIELD_ALIASES.items():
-        if canonical == key:
-            if canonical in obj: return obj[canonical]
-            if canonical.lower() in obj: return obj[canonical.lower()]
-        for alt in alts:
-            if alt in obj: return obj[alt]
-            if alt.lower() in obj: return obj[alt.lower()]
-    got = _get_nested(obj, key)
-    return got
-
-# =============================================================================
-# Executor
-# =============================================================================
-
-def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, Any]:
+# ----------------------------- main executor ----------------------------------
+def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Executes planner calls with:
-      - universal get_field across all domains
-      - deterministic calculators (legacy)
-      - optional semantic_search
-      - RAG (LangChain conversational memory)
+    cfg expects:
+      - app_yaml: path to app.yaml (embeddings, index dir)
+      - intent: optional string
+      - question: original user text (for RAG lane)
+      - session_id: conversation id for memory
     """
     results: Dict[str, Any] = {}
 
-    account_id = (config_paths or {}).get("account_id") or _pick_account_id(calls, config_paths) or "default"
-    original_question = (config_paths or {}).get("question")
-    session_id = (config_paths or {}).get("session_id") or "default"
+    # config for embeddings / FAISS
+    app_yaml = (cfg or {}).get("app_yaml") or "config/app.yaml"
+    app_cfg = _read_app_cfg(app_yaml)
+    index_dir = ((app_cfg.get("indexes") or {}).get("dir")) or "var/indexes"
+    embedder = _build_embedder_from_cfg(app_cfg)
 
-    # Load per-account data
-    txns = load_transactions(account_id)
-    pays = load_payments(account_id)
-    stmts = load_statements(account_id)
-    acct  = load_account_summary(account_id)
+    # handy values for RAG
+    session_id = (cfg or {}).get("session_id") or "default"
+    question   = (cfg or {}).get("question") or ""
 
-    stmt_periods = [s.get("period") for s in stmts if isinstance(s, dict) and s.get("period")]
-    latest_stmt_period = max(stmt_periods) if stmt_periods else None
+    # we’ll lazy-load datasets per account_id when needed
+    cache: Dict[str, Dict[str, Any]] = {}  # account_id -> {domain->data}
+
+    def _ensure_datasets(aid: str) -> Dict[str, Any]:
+        ds = cache.get(aid)
+        if ds is None:
+            ds = {
+                "transactions": load_transactions(aid),
+                "payments":     load_payments(aid),
+                "statements":   load_statements(aid),
+                "account_summary": load_account_summary(aid),
+            }
+            cache[aid] = ds
+        return ds
 
     for i, call in enumerate(calls or []):
-        dom = _as_str(call.get("domain_id")).strip().lower().replace("-", "_")
-        cap = _as_str(call.get("capability")).strip().lower().replace("-", "_")
+        dom = str(call.get("domain_id", "")).strip().lower().replace("-", "_")
+        cap = str(call.get("capability", "")).strip().lower().replace("-", "_")
         args = dict(call.get("args") or {})
-        key  = f"{account_id}:{dom}.{cap}[{i}]"
-        res: Any = {"error": f"Unknown domain {dom}"}
+        key  = f"{dom}.{cap}[{i}]"
 
-        # ======================= TRANSACTIONS =================================
-        if dom == "transactions":
-            if cap == "get_field":
-                key_path = _as_str(args.get("key_path") or args.get("key")).strip()
-                if not key_path:
-                    res = {"error": "key_path is required"}
-                else:
-                    rows = txns
-                    rows = [t for t in rows if _within_period(t, args.get("period"))]
-                    rows = _apply_filters(rows, args.get("filter") or {})
-                    rows = _sort_rows(rows, args.get("sort_by"), _as_str(args.get("order") or "desc"))
-                    if args.get("limit"):
-                        try: rows = rows[: int(args["limit"])]
-                        except Exception: pass
-                    values = _project_values(rows, key_path)
-                    agg_val = _aggregate(values, args.get("agg"))
-                    res = {
-                        "values": agg_val if args.get("agg") in (None, "unique") else ([agg_val] if args.get("agg") else values),
-                        "count": len(rows),
-                        "trace": {"key_path": key_path, "filtered": len(rows)}
+        # pick account_id when relevant
+        account_id = args.get("account_id") or (cfg or {}).get("account_id")  # optional
+
+        # --------- RAG lane ---------------------------------------------------
+        if dom == "rag":
+            try:
+                if cap in {"unified_answer", "account_answer"}:
+                    ds = _ensure_datasets(account_id) if account_id else {
+                        "transactions": [], "payments": [], "statements": [], "account_summary": {}
                     }
-
-            elif cap == "last_transaction":
-                aid = args.get("account_id")
-                cand = [t for t in txns if (not aid or t.get("accountId") == aid)]
-                if not cand:
-                    res = {"error": "No transactions", "trace": {"count": 0}}
+                    knowledge_paths = [
+                        "data/knowledge/handbook.md",
+                        "data/agreement/Apple-Card-Customer-Agreement.pdf",
+                    ]
+                    res = unified_rag_answer(
+                        question=question or args.get("question", ""),
+                        session_id=session_id,
+                        account_id=account_id or "default",
+                        txns=ds["transactions"], pays=ds["payments"],
+                        stmts=ds["statements"],  acct=ds["account_summary"],
+                        knowledge_paths=knowledge_paths,
+                        top_k=int(args.get("k", 5))
+                    )
+                elif cap == "knowledge_answer":
+                    res = knowledge_rag_answer(
+                        question=question or args.get("question", ""),
+                        session_id=session_id,
+                        k=int(args.get("k", 5))
+                    )
                 else:
-                    last = max(cand, key=_txn_ts)
-                    res = {"item": last}
+                    res = {"error": f"Unknown rag capability '{cap}'"}
+            except Exception as e:
+                res = {"error": f"RAG failure: {e}"}
+            results[key] = res
+            continue
 
-            elif cap == "top_merchants":
-                period = args.get("period")
-                aid    = args.get("account_id")
-                cand = [t for t in txns if (not aid or t.get("accountId") == aid)]
-                cand = [t for t in cand if _within_period(t, period)]
-                cand = [
-                    t for t in cand
-                    if _as_str(t.get("transactionStatus")).upper() == "POSTED"
-                    and "PURCHASE" in _as_str(t.get("displayTransactionType")).upper()
-                    and _to_float(t.get("amount"), 0.0) > 0
-                ]
-                totals: Dict[str, float] = {}
-                for t in cand:
-                    m = (t.get("merchantName") or "UNKNOWN").strip()
-                    totals[m] = totals.get(m, 0.0) + _to_float(t.get("amount"), 0.0)
-                top = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
-                res = {"top_merchants": [{"merchant": m, "total": v} for m, v in top],
-                       "trace": {"count": len(cand), "period": period or "ALL"}}
+        # --------- Generic 5-op DSL (works for any domain) --------------------
+        if cap in {"get_field", "find_latest", "sum_where", "topk_by_sum", "list_where", "semantic_search"}:
+            try:
+                ds = _ensure_datasets(account_id) if account_id else {
+                    "transactions": [], "payments": [], "statements": [], "account_summary": {}
+                }
+                if cap == "get_field":
+                    res = _op_get_field(dom, args, ds)
+                elif cap == "find_latest":
+                    res = _op_find_latest(dom, args, ds)
+                elif cap == "sum_where":
+                    res = _op_sum_where(dom, args, ds)
+                elif cap == "topk_by_sum":
+                    res = _op_topk_by_sum(dom, args, ds)
+                elif cap == "list_where":
+                    res = _op_list_where(dom, args, ds)
+                else:  # semantic_search
+                    if dom != "transactions":
+                        res = {"error": "semantic_search currently supported for transactions only"}
+                    else:
+                        res = _op_semantic_search_transactions(args, index_dir=index_dir, embedder=embedder)
+            except Exception as e:
+                res = {"error": f"{cap} failed: {e}"}
+            results[key] = res
+            continue
 
-            elif cap == "find_by_merchant":
-                q = _as_str(args.get("merchant_query")).strip().lower()
-                if not q:
-                    res = {"error": "merchant_query is required"}
-                else:
+        # --------- Legacy deterministic calculators ---------------------------
+        try:
+            if dom == "transactions":
+                ds = _ensure_datasets(account_id)
+                txns = ds["transactions"]
+                if cap == "last_transaction":
+                    cand = [t for t in txns if (not account_id or t.get("accountId") == account_id)]
+                    last = max(cand, key=_latest_key) if cand else None
+                    res = {"item": last, "trace": {"count": len(cand)}}
+                elif cap == "top_merchants":
                     period = args.get("period")
-                    aid    = args.get("account_id")
-                    cand = [t for t in txns if (not aid or t.get("accountId") == aid)]
-                    cand = [t for t in cand if _within_period(t, period)]
-                    hits = [t for t in cand if q in _as_str(t.get("merchantName")).lower()]
-                    hits.sort(key=_txn_ts, reverse=True)
-                    res = {"items": hits, "count": len(hits), "trace": {"merchant_query": q, "period": period or "ALL"}}
-
-            elif cap == "list_over_threshold":
-                thr = float(args.get("threshold", 0))
-                res = txn_calc.list_over_threshold(txns, args.get("account_id"), thr, args.get("period"))
-
-            elif cap == "spend_in_period":
-                res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
-
-            elif cap == "purchases_in_cycle":
-                res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
-
-            elif cap == "max_amount":
-                res = txn_calc.max_amount(
-                    txns, args.get("account_id"), args.get("period"),
-                    args.get("period_start"), args.get("period_end"),
-                    args.get("category"), int(args.get("top", 1)),
-                )
-
-            elif cap == "aggregate_by_category":
-                res = txn_calc.aggregate_by_category(
-                    txns, args.get("account_id"),
-                    args.get("period"), args.get("period_start"), args.get("period_end"),
-                )
-
-            elif cap == "average_per_month":
-                res = txn_calc.average_per_month(
-                    txns, args.get("account_id"),
-                    args.get("period"), args.get("period_start"), args.get("period_end"),
-                    bool(args.get("include_credits", False)),
-                )
-
-            elif cap == "semantic_search":
-                if not _FAISS_AVAILABLE:
-                    res = {"error": "semantic_search not available (FAISS missing)"}
-                else:
-                    q_raw = _as_str(args.get("query") or args.get("category")).strip()
-                    k     = int(args.get("k", 5))
-                    if not q_raw:
-                        res = {"hits": [], "error": "query is required", "trace": {"k": k}}
-                    else:
-                        hits = query_index("transactions", q_raw, top_k=max(1, k))
-                        res  = {"hits": hits, "trace": {"k": k, "query": q_raw}}
-            else:
-                res = {"error": f"Unknown capability {cap}"}
-
-        # ============================ PAYMENTS ================================
-        elif dom == "payments":
-            if cap == "get_field":
-                key_path = _as_str(args.get("key_path") or args.get("key")).strip()
-                if not key_path:
-                    res = {"error": "key_path is required"}
-                else:
-                    rows = _apply_filters(pays, args.get("filter") or {})
-                    rows = _sort_rows(rows, args.get("sort_by"), _as_str(args.get("order") or "desc"))
-                    if args.get("limit"):
-                        try: rows = rows[: int(args["limit"])]
-                        except Exception: pass
-                    values = _project_values(rows, key_path)
-                    agg_val = _aggregate(values, args.get("agg"))
-                    res = {
-                        "values": agg_val if args.get("agg") in (None, "unique") else ([agg_val] if args.get("agg") else values),
-                        "count": len(rows),
-                        "trace": {"key_path": key_path, "filtered": len(rows)}
-                    }
-
-            elif cap == "last_payment":
-                res = pay_calc.last_payment(pays, args.get("account_id"))
-            elif cap == "payments_in_period":
-                res = pay_calc.payments_in_period(pays, args.get("account_id"), args.get("period"))
-            elif cap == "total_credited_year":
-                yr = args.get("year")
-                res = pay_calc.total_credited_year(pays, args.get("account_id"), int(yr) if yr else None)
-            else:
-                res = {"error": f"Unknown capability {cap}"}
-
-        # ============================ STATEMENTS ==============================
-        elif dom == "statements":
-            if cap == "get_field":
-                key_path = _as_str(args.get("key_path") or args.get("key")).strip()
-                if not key_path:
-                    res = {"error": "key_path is required"}
-                else:
-                    rows = _apply_filters(stmts, args.get("filter") or {})
-                    rows = _sort_rows(rows, args.get("sort_by"), _as_str(args.get("order") or "desc"))
-                    if args.get("limit"):
-                        try: rows = rows[: int(args["limit"])]
-                        except Exception: pass
-                    values = _project_values(rows, key_path)
-                    agg_val = _aggregate(values, args.get("agg"))
-                    res = {
-                        "values": agg_val if args.get("agg") in (None, "unique") else ([agg_val] if args.get("agg") else values),
-                        "count": len(rows),
-                        "trace": {"key_path": key_path, "filtered": len(rows)}
-                    }
-
-            else:
-                if not args.get("period"):
-                    if args.get("nonzero"):
-                        nz = [s.get("period") for s in stmts if _to_float(s.get("interestCharged")) > 0]
-                        args["period"] = max(nz) if nz else latest_stmt_period
-                    else:
-                        args["period"] = latest_stmt_period
-
-                if cap == "total_interest":
-                    prd = args.get("period")
-                    row = next((s for s in stmts if s.get("period") == prd), None)
-                    if not row:
-                        res = {"error": "No statement for period", "trace": {"period": prd}}
-                    else:
-                        res = {
-                            "interest_total": _to_float(row.get("interestCharged")),
-                            "trace": {"period": prd, "close_date": row.get("closingDateTime")}
-                        }
-                elif cap == "interest_breakdown":
-                    res = stmt_calc.interest_breakdown(stmts, args.get("account_id"), args.get("period"))
-                elif cap == "trailing_interest":
-                    res = stmt_calc.trailing_interest(stmts, args.get("account_id"), args.get("period"))
+                    rows = [t for t in txns if _within_period(t, period)]
+                    rows = [t for t in rows if (t.get("transactionType") == "DEBIT" or (t.get("amount") or 0) > 0)]
+                    agg: Dict[str, float] = {}
+                    for t in rows:
+                        m = (t.get("merchantName") or "UNKNOWN").strip()
+                        agg[m] = agg.get(m, 0.0) + float(t.get("amount") or 0.0)
+                    top = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
+                    res = {"top_merchants": [{"merchant": m, "total": v} for m, v in top],
+                           "trace": {"count": len(rows), "period": period or "ALL"}}
+                elif cap == "spend_in_period":
+                    res = txn_calc.spend_in_period(txns, account_id, args.get("period"))
+                elif cap == "list_over_threshold":
+                    thr = float(args.get("threshold", 0))
+                    res = txn_calc.list_over_threshold(txns, account_id, thr, args.get("period"))
+                elif cap == "average_per_month":
+                    res = txn_calc.average_per_month(txns, account_id, args.get("period"), None, None, False)
+                elif cap == "find_by_merchant":
+                    q = (args.get("merchant_query") or "").strip().lower()
+                    hits = [t for t in txns if q and q in (t.get("merchantName") or "").lower()]
+                    hits.sort(key=_latest_key, reverse=True)
+                    res = {"items": hits, "count": len(hits)}
                 else:
                     res = {"error": f"Unknown capability {cap}"}
 
-        # ======================== ACCOUNT SUMMARY =============================
-        elif dom == "account_summary":
-            if cap == "get_field":
-                key_path = _as_str(args.get("key_path") or args.get("key")).strip()
-                if not key_path:
-                    res = {"error": "key_path is required"}
+            elif dom == "payments":
+                ds = _ensure_datasets(account_id)
+                pays = ds["payments"]
+                if cap == "last_payment":
+                    res = pay_calc.last_payment(pays, account_id)
+                elif cap == "total_credited_year":
+                    yr = args.get("year")
+                    res = pay_calc.total_credited_year(pays, account_id, int(yr) if yr else None)
+                elif cap == "payments_in_period":
+                    res = pay_calc.payments_in_period(pays, account_id, args.get("period"))
                 else:
-                    val = _get_field_with_alias(acct, key_path)
-                    if val is None:
-                        val = _get_nested(acct, key_path)
-                    res = {"value": val, "trace": {"key_path": key_path}}
+                    res = {"error": f"Unknown capability {cap}"}
 
-            elif cap == "current_balance":
-                res = acct_calc.current_balance(acct)
-            elif cap == "available_credit":
-                res = acct_calc.available_credit(acct)
-            else:
-                res = {"error": f"Unknown capability {cap}"}
-
-        # ================================ RAG =================================
-        elif dom == "rag":
-            scope = (args.get("scope") or "account").lower()
-            q = args.get("question") or original_question
-            sess = args.get("session_id") or session_id
-            if not q:
-                res = {"error": "question is required for rag"}
-            else:
-                if scope == "knowledge":
-                    res = knowledge_rag_answer(q, sess, k=int(args.get("k", 6)))
+            elif dom == "statements":
+                ds = _ensure_datasets(account_id)
+                stmts = ds["statements"]
+                if cap == "total_interest":
+                    prd = args.get("period")
+                    if prd is None:
+                        # pick latest, optionally nonzero
+                        nz = bool(args.get("nonzero"))
+                        cand = [s for s in stmts if (s.get("interestCharged") or 0) > 0] if nz else stmts
+                        if not cand:
+                            res = {"error": "No statements"}
+                        else:
+                            row = max(cand, key=_latest_key)
+                            res = {"interest_total": row.get("interestCharged") or 0.0,
+                                   "trace": {"period": row.get("period")}}
+                    else:
+                        row = next((s for s in stmts if s.get("period") == prd), None)
+                        res = {"interest_total": (row or {}).get("interestCharged") or 0.0,
+                               "trace": {"period": prd}}
+                elif cap == "interest_breakdown":
+                    res = stmt_calc.interest_breakdown(stmts, account_id, args.get("period"))
+                elif cap == "trailing_interest":
+                    res = stmt_calc.trailing_interest(stmts, account_id, args.get("period"))
                 else:
-                    aid = args.get("account_id") or account_id
-                    res = account_rag_answer(q, sess, aid, k=int(args.get("k", 6)))
+                    res = {"error": f"Unknown capability {cap}"}
 
-        else:
-            res = {"error": f"Unknown domain {dom}"}
+            elif dom == "account_summary":
+                ds = _ensure_datasets(account_id)
+                acct = ds["account_summary"]
+                if cap == "current_balance":
+                    res = acct_calc.current_balance(acct)
+                elif cap == "available_credit":
+                    res = acct_calc.available_credit(acct)
+                elif cap == "get_field":
+                    res = _op_get_field("account_summary", args, ds)
+                else:
+                    res = {"error": f"Unknown capability {cap}"}
+
+            else:
+                # optional: route unknown domains to RAG fallback
+                ds = _ensure_datasets(account_id) if account_id else {
+                    "transactions": [], "payments": [], "statements": [], "account_summary": {}
+                }
+                res = unified_rag_answer(
+                    question=question,
+                    session_id=session_id,
+                    account_id=account_id or "default",
+                    txns=ds["transactions"], pays=ds["payments"],
+                    stmts=ds["statements"],  acct=ds["account_summary"],
+                    knowledge_paths=[
+                        "data/knowledge/handbook.md",
+                        "data/agreement/Apple-Card-Customer-Agreement.pdf",
+                    ],
+                    top_k=5
+                )
+        except Exception as e:
+            res = {"error": f"Execution failed for {dom}.{cap}: {e}"}
 
         results[key] = res
 
