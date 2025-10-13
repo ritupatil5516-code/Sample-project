@@ -1,9 +1,8 @@
 # core/orchestrator/compose_answer.py
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 import json
-import math
 
 # ------------------ small helpers ------------------
 
@@ -44,7 +43,6 @@ def _is_scalar(x: Any) -> bool:
     return not isinstance(x, (dict, list))
 
 def _fmt_scalar(x: Any) -> str:
-    # Money-ish if numeric and magnitude >= 1; else show raw
     try:
         f = float(x)
         return _fmt_money(f) if abs(f) >= 1.0 else str(x)
@@ -54,39 +52,27 @@ def _fmt_scalar(x: Any) -> str:
 # ------------------ renderers per op ------------------
 
 def _render_get_field_scalar(value: Any) -> str:
-    if isinstance(value, (int, float)):  # heuristically money-ish if large
+    if isinstance(value, (int, float)):
         return _fmt_money(value) if abs(float(value)) >= 1 else str(value)
     return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
 
 def _render_get_field_series(values: List[Any], total_count: Optional[int] = None) -> str:
-    """
-    Pretty-prints a list of values coming from universal get_field (transactions/payments/statements).
-    - Scalars: comma-join if small, bullets if longer
-    - Objects: compact JSON lines (shortened)
-    """
     if not values:
         return "No results."
-
-    # If all scalars, format them smartly
     if all(_is_scalar(v) for v in values):
         formatted = [_fmt_scalar(v) for v in values]
         if len(formatted) <= 6:
-            out = ", ".join(formatted)
-        else:
-            lines = [f"- {v}" for v in formatted[:15]]
-            extra = (total_count or len(formatted)) - min(15, len(formatted))
-            if extra > 0:
-                lines.append(f"... and {extra} more")
-            out = "\n".join(lines)
-        return out
-
-    # Otherwise, at least one dict/list → render compact JSON lines (truncate each)
+            return ", ".join(formatted)
+        lines = [f"- {v}" for v in formatted[:15]]
+        extra = (total_count or len(formatted)) - min(15, len(formatted))
+        if extra > 0:
+            lines.append(f"... and {extra} more")
+        return "\n".join(lines)
     lines = []
     max_lines = 10
     for v in values[:max_lines]:
         if isinstance(v, (dict, list)):
-            j = json.dumps(v, ensure_ascii=False)
-            lines.append(_shorten(j, 120))
+            lines.append(_shorten(json.dumps(v, ensure_ascii=False), 120))
         else:
             lines.append(_shorten(_fmt_scalar(v), 120))
     extra = (total_count or len(values)) - min(max_lines, len(values))
@@ -95,26 +81,17 @@ def _render_get_field_series(values: List[Any], total_count: Optional[int] = Non
     return "\n".join(lines)
 
 def _render_get_field_payload(payload: Dict[str, Any]) -> str:
-    """
-    Supports both shapes:
-      - account_summary.get_field -> {"value": ...}
-      - list-domain get_field     -> {"values":[...], "count":N, ...}
-    """
     if isinstance(payload, dict):
         if "value" in payload:
             return _render_get_field_scalar(payload.get("value"))
         if "values" in payload:
             vals = payload.get("values") or []
             total = payload.get("count")
-            # If the executor returned a *single aggregate* (e.g., sum/avg) inside "values",
-            # normalize to scalar display.
             if not isinstance(vals, list):
                 return _render_get_field_scalar(vals)
-            # Some executors might wrap scalar outputs as list-of-one
             if len(vals) == 1 and _is_scalar(vals[0]):
                 return _render_get_field_scalar(vals[0])
             return _render_get_field_series(vals, total)
-    # Fallback
     return _shorten(json.dumps(payload, ensure_ascii=False))
 
 def _render_find_latest(payload: Dict[str, Any]) -> str:
@@ -195,10 +172,12 @@ def _render_legacy_value(payload: Dict[str, Any]) -> Optional[str]:
 
 def compose_answer(question: str, plan: Dict[str, Any], results: Dict[str, Any]) -> str:
     """
-    Formats the heterogeneous `results` from execute_calls into a single answer string.
-    Works with:
-      - 5-op DSL: get_field, find_latest, sum_where, topk_by_sum, list_where, semantic_search
-      - legacy calculators: current_balance, available_credit, total_interest, etc.
+    Formats results from execute_calls into a single string.
+    Supports:
+      - universal get_field (value/values)
+      - legacy calculators
+      - semantic_search
+      - rag.{account_answer,knowledge_answer}
     """
     if not results:
         return "I couldn't find anything for that."
@@ -216,7 +195,6 @@ def compose_answer(question: str, plan: Dict[str, Any], results: Dict[str, Any])
         op = rest.split("[", 1)[0]
 
         if op == "get_field":
-            # Now supports both shapes ({value} and {values})
             lines.append(_render_get_field_payload(payload if isinstance(payload, dict) else {}))
         elif op == "find_latest":
             lines.append(_render_find_latest(payload if isinstance(payload, dict) else {}))
@@ -243,6 +221,15 @@ def compose_answer(question: str, plan: Dict[str, Any], results: Dict[str, Any])
                     if ts: s += f" · {ts}"
                     view.append(s)
                 lines.append("\n".join(view))
+        elif op in ("account_answer", "knowledge_answer"):
+            ans = (payload or {}).get("answer") if isinstance(payload, dict) else None
+            srcs = (payload or {}).get("sources") if isinstance(payload, dict) else None
+            part = (ans or "").strip() or "I couldn't find anything relevant."
+            if srcs:
+                part += "\n\nSources:\n" + "\n".join(
+                    f"- {s.get('source')}: {_shorten(s.get('snippet'),100)}" for s in (srcs or [])[:5]
+                )
+            lines.append(part)
         else:
             rendered = _render_legacy_value(payload if isinstance(payload, dict) else {})
             if rendered:

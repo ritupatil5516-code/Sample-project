@@ -1,31 +1,35 @@
 # core/orchestrator/execute.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Iterable, Tuple
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
+import json
 import os
 
-# ---- domain loaders (your existing modules)
+# ---- domain loaders
 from domains.transactions.loader import load_transactions
 from domains.payments.loader import load_payments
 from domains.statements.loader import load_statements
 from domains.account_summary.loader import load_account_summary
 
-# ---- existing calculators (keep)
+# ---- calculators (keep)
 from domains.transactions import calculator as txn_calc
 from domains.payments import calculator as pay_calc
 from domains.statements import calculator as stmt_calc
 from domains.account_summary import calculator as acct_calc
 
-# ---- optional semantic search (if available)
+# ---- optional semantic search (if present)
 try:
     from core.index.faiss_registry import query_index  # type: ignore
     _FAISS_AVAILABLE = True
 except Exception:
     _FAISS_AVAILABLE = False
 
+# ---- RAG (LangChain conversational retrieval)
+from core.retrieval.rag_chain import account_rag_answer, knowledge_rag_answer
+
 # =============================================================================
-# Generic helpers
+# Helpers
 # =============================================================================
 
 def _as_str(x: Any) -> str:
@@ -62,8 +66,7 @@ def _within_period(txn: Dict[str, Any], period: Optional[str]) -> bool:
         return False
     if p == "LAST_12M":
         return ts >= (datetime.now(timezone.utc) - timedelta(days=365))
-    # YYYY-MM
-    if len(period) == 7 and period[4] == "-":
+    if len(period) == 7 and period[4] == "-":  # YYYY-MM
         return ts.strftime("%Y-%m") == period
     return True
 
@@ -77,7 +80,6 @@ def _pick_account_id(calls: List[dict], cfg: Dict[str, Any]) -> Optional[str]:
             return str(a["account_id"])
     return None
 
-# dotted key-path on dict
 def _get_nested(d: Any, dotted: str) -> Any:
     cur = d
     for part in (dotted or "").split("."):
@@ -89,7 +91,6 @@ def _get_nested(d: Any, dotted: str) -> Any:
             return None
     return cur
 
-# equals/contains filters: {"field": "POSTED", "merchantName~": "apple"}
 def _apply_filters(rows: List[Dict[str, Any]], flt: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not flt:
         return rows
@@ -127,34 +128,26 @@ def _aggregate(values: List[Any], agg: Optional[str]) -> Any:
     a = (agg or "").lower()
     if not values:
         return None if a in ("first", "last", "max", "min", "avg", "sum") else 0
-    if a == "first":
-        return values[0]
-    if a == "last":
-        return values[-1]
+    if a == "first": return values[0]
+    if a == "last":  return values[-1]
     if a == "max":
-        try:
-            return max(values)
-        except Exception:
-            return None
+        try: return max(values)
+        except Exception: return None
     if a == "min":
-        try:
-            return min(values)
-        except Exception:
-            return None
-    if a == "sum":
-        return sum(_to_float(v, 0.0) for v in values)
+        try: return min(values)
+        except Exception: return None
+    if a == "sum": return sum(_to_float(v, 0.0) for v in values)
     if a == "avg":
         nums = [_to_float(v, 0.0) for v in values]
         return (sum(nums) / len(nums)) if nums else 0.0
-    if a == "count":
-        return len(values)
+    if a == "count": return len(values)
     if a == "unique":
-        return list({json.dumps(v, sort_keys=True) for v in values})  # crude unique
+        try:
+            # JSON-string unique; lightweight
+            return list({json.dumps(v, sort_keys=True) for v in values})
+        except Exception:
+            return list({str(v) for v in values})
     return values
-
-# =============================================================================
-# Field aliases for account_summary (so literal phrasing just works)
-# =============================================================================
 
 FIELD_ALIASES: Dict[str, List[str]] = {
     "accountStatus": ["status", "account status", "state", "account_state"],
@@ -167,12 +160,9 @@ FIELD_ALIASES: Dict[str, List[str]] = {
 }
 
 def _get_field_with_alias(obj: Dict[str, Any], key: str) -> Any:
-    # exact
-    if key in obj:
-        return obj[key]
+    if key in obj: return obj[key]
     low = key.lower()
-    if low in obj:
-        return obj[low]
+    if low in obj: return obj[low]
     for canonical, alts in FIELD_ALIASES.items():
         if canonical == key:
             if canonical in obj: return obj[canonical]
@@ -180,34 +170,28 @@ def _get_field_with_alias(obj: Dict[str, Any], key: str) -> Any:
         for alt in alts:
             if alt in obj: return obj[alt]
             if alt.lower() in obj: return obj[alt.lower()]
-    # dotted support for nested fields
     got = _get_nested(obj, key)
     return got
 
 # =============================================================================
-# Public executor
+# Executor
 # =============================================================================
 
 def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Executes planner calls. Adds a universal `get_field` that works across ALL domains:
-      - account_summary: read from single object (aliases supported)
-      - transactions/payments/statements: read from list with filter/sort/limit/agg
-
-    Args supported by get_field for list domains:
-      - key_path: dotted path (required)
-      - filter: dict of equals/contains (use '~' suffix for contains, case-insensitive)
-      - sort_by: dotted path
-      - order: 'desc'|'asc' (default 'desc')
-      - limit: int (optional)
-      - agg: 'first'|'last'|'max'|'min'|'sum'|'avg'|'count'|'unique' (optional)
-      - period: optional (for transactions convenience; applies BEFORE filters)
-      - account_id: optional override
+    Executes planner calls with:
+      - universal get_field across all domains
+      - deterministic calculators (legacy)
+      - optional semantic_search
+      - RAG (LangChain conversational memory)
     """
     results: Dict[str, Any] = {}
 
-    # Resolve account + load data
     account_id = (config_paths or {}).get("account_id") or _pick_account_id(calls, config_paths) or "default"
+    original_question = (config_paths or {}).get("question")
+    session_id = (config_paths or {}).get("session_id") or "default"
+
+    # Load per-account data
     txns = load_transactions(account_id)
     pays = load_payments(account_id)
     stmts = load_statements(account_id)
@@ -223,31 +207,24 @@ def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, 
         key  = f"{account_id}:{dom}.{cap}[{i}]"
         res: Any = {"error": f"Unknown domain {dom}"}
 
-        # ------------------------- TRANSACTIONS -------------------------------
+        # ======================= TRANSACTIONS =================================
         if dom == "transactions":
             if cap == "get_field":
-                # universal field getter on the transactions list
                 key_path = _as_str(args.get("key_path") or args.get("key")).strip()
                 if not key_path:
                     res = {"error": "key_path is required"}
                 else:
                     rows = txns
-                    # optional period pre-filter
                     rows = [t for t in rows if _within_period(t, args.get("period"))]
-                    # optional equals/contains filters
                     rows = _apply_filters(rows, args.get("filter") or {})
-                    # optional sort/limit/agg
                     rows = _sort_rows(rows, args.get("sort_by"), _as_str(args.get("order") or "desc"))
                     if args.get("limit"):
-                        try:
-                            rows = rows[: int(args["limit"])]
-                        except Exception:
-                            pass
+                        try: rows = rows[: int(args["limit"])]
+                        except Exception: pass
                     values = _project_values(rows, key_path)
-                    value_or_values = _aggregate(values, args.get("agg"))
-                    # uniform shape
+                    agg_val = _aggregate(values, args.get("agg"))
                     res = {
-                        "values": value_or_values if args.get("agg") in (None, "unique") else ([value_or_values] if args.get("agg") else values),
+                        "values": agg_val if args.get("agg") in (None, "unique") else ([agg_val] if args.get("agg") else values),
                         "count": len(rows),
                         "trace": {"key_path": key_path, "filtered": len(rows)}
                     }
@@ -266,7 +243,6 @@ def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, 
                 aid    = args.get("account_id")
                 cand = [t for t in txns if (not aid or t.get("accountId") == aid)]
                 cand = [t for t in cand if _within_period(t, period)]
-                # strict: posted + purchase + positive amount
                 cand = [
                     t for t in cand
                     if _as_str(t.get("transactionStatus")).upper() == "POSTED"
@@ -297,27 +273,33 @@ def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, 
             elif cap == "list_over_threshold":
                 thr = float(args.get("threshold", 0))
                 res = txn_calc.list_over_threshold(txns, args.get("account_id"), thr, args.get("period"))
+
             elif cap == "spend_in_period":
                 res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
+
             elif cap == "purchases_in_cycle":
                 res = txn_calc.spend_in_period(txns, args.get("account_id"), args.get("period"))
+
             elif cap == "max_amount":
                 res = txn_calc.max_amount(
                     txns, args.get("account_id"), args.get("period"),
                     args.get("period_start"), args.get("period_end"),
                     args.get("category"), int(args.get("top", 1)),
                 )
+
             elif cap == "aggregate_by_category":
                 res = txn_calc.aggregate_by_category(
                     txns, args.get("account_id"),
                     args.get("period"), args.get("period_start"), args.get("period_end"),
                 )
+
             elif cap == "average_per_month":
                 res = txn_calc.average_per_month(
                     txns, args.get("account_id"),
                     args.get("period"), args.get("period_start"), args.get("period_end"),
                     bool(args.get("include_credits", False)),
                 )
+
             elif cap == "semantic_search":
                 if not _FAISS_AVAILABLE:
                     res = {"error": "semantic_search not available (FAISS missing)"}
@@ -332,7 +314,7 @@ def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, 
             else:
                 res = {"error": f"Unknown capability {cap}"}
 
-        # --------------------------- PAYMENTS ---------------------------------
+        # ============================ PAYMENTS ================================
         elif dom == "payments":
             if cap == "get_field":
                 key_path = _as_str(args.get("key_path") or args.get("key")).strip()
@@ -342,14 +324,12 @@ def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, 
                     rows = _apply_filters(pays, args.get("filter") or {})
                     rows = _sort_rows(rows, args.get("sort_by"), _as_str(args.get("order") or "desc"))
                     if args.get("limit"):
-                        try:
-                            rows = rows[: int(args["limit"])]
-                        except Exception:
-                            pass
+                        try: rows = rows[: int(args["limit"])]
+                        except Exception: pass
                     values = _project_values(rows, key_path)
-                    value_or_values = _aggregate(values, args.get("agg"))
+                    agg_val = _aggregate(values, args.get("agg"))
                     res = {
-                        "values": value_or_values if args.get("agg") in (None, "unique") else ([value_or_values] if args.get("agg") else values),
+                        "values": agg_val if args.get("agg") in (None, "unique") else ([agg_val] if args.get("agg") else values),
                         "count": len(rows),
                         "trace": {"key_path": key_path, "filtered": len(rows)}
                     }
@@ -364,7 +344,7 @@ def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, 
             else:
                 res = {"error": f"Unknown capability {cap}"}
 
-        # --------------------------- STATEMENTS -------------------------------
+        # ============================ STATEMENTS ==============================
         elif dom == "statements":
             if cap == "get_field":
                 key_path = _as_str(args.get("key_path") or args.get("key")).strip()
@@ -374,20 +354,17 @@ def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, 
                     rows = _apply_filters(stmts, args.get("filter") or {})
                     rows = _sort_rows(rows, args.get("sort_by"), _as_str(args.get("order") or "desc"))
                     if args.get("limit"):
-                        try:
-                            rows = rows[: int(args["limit"])]
-                        except Exception:
-                            pass
+                        try: rows = rows[: int(args["limit"])]
+                        except Exception: pass
                     values = _project_values(rows, key_path)
-                    value_or_values = _aggregate(values, args.get("agg"))
+                    agg_val = _aggregate(values, args.get("agg"))
                     res = {
-                        "values": value_or_values if args.get("agg") in (None, "unique") else ([value_or_values] if args.get("agg") else values),
+                        "values": agg_val if args.get("agg") in (None, "unique") else ([agg_val] if args.get("agg") else values),
                         "count": len(rows),
                         "trace": {"key_path": key_path, "filtered": len(rows)}
                     }
 
             else:
-                # keep your deterministic ops
                 if not args.get("period"):
                     if args.get("nonzero"):
                         nz = [s.get("period") for s in stmts if _to_float(s.get("interestCharged")) > 0]
@@ -412,14 +389,13 @@ def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, 
                 else:
                     res = {"error": f"Unknown capability {cap}"}
 
-        # ------------------------ ACCOUNT SUMMARY -----------------------------
+        # ======================== ACCOUNT SUMMARY =============================
         elif dom == "account_summary":
             if cap == "get_field":
                 key_path = _as_str(args.get("key_path") or args.get("key")).strip()
                 if not key_path:
                     res = {"error": "key_path is required"}
                 else:
-                    # try alias/canonical direct, then dotted
                     val = _get_field_with_alias(acct, key_path)
                     if val is None:
                         val = _get_nested(acct, key_path)
@@ -431,6 +407,20 @@ def execute_calls(calls: List[dict], config_paths: Dict[str, Any]) -> Dict[str, 
                 res = acct_calc.available_credit(acct)
             else:
                 res = {"error": f"Unknown capability {cap}"}
+
+        # ================================ RAG =================================
+        elif dom == "rag":
+            scope = (args.get("scope") or "account").lower()
+            q = args.get("question") or original_question
+            sess = args.get("session_id") or session_id
+            if not q:
+                res = {"error": "question is required for rag"}
+            else:
+                if scope == "knowledge":
+                    res = knowledge_rag_answer(q, sess, k=int(args.get("k", 6)))
+                else:
+                    aid = args.get("account_id") or account_id
+                    res = account_rag_answer(q, sess, aid, k=int(args.get("k", 6)))
 
         else:
             res = {"error": f"Unknown domain {dom}"}
