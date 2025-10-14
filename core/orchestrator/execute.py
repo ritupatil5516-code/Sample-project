@@ -609,40 +609,49 @@ def _op_semantic_search(
 # dotted / bracket path getter that also supports list/tuple parts
 def _get_path(obj, path):
     """
-    Examples accepted:
+    Robust getter that supports:
       - "persons[0].ownershipType"
       - "persons.0.ownershipType"
       - ["persons", 0, "ownershipType"]
     """
-    # Normalize to a list of parts
+    # normalize to parts
     if isinstance(path, (list, tuple)):
         parts = list(path)
     else:
         s = str(path)
-        # turn bracket indexing into dotted segments -> persons[0] -> persons.0
         s = s.replace('[', '.').replace(']', '')
         parts = [p for p in s.split('.') if p]
 
     cur = obj
     for part in parts:
-        # If current node is a list, treat part as an index
         if isinstance(cur, list):
             try:
                 idx = part if isinstance(part, int) else int(str(part))
                 cur = cur[idx]
             except Exception:
                 return None
-        # If current node is a dict, treat part as a key
         elif isinstance(cur, dict):
             key = part if isinstance(part, str) else str(part)
             cur = cur.get(key)
         else:
             return None
-
         if cur is None:
             return None
-
     return cur
+
+
+def _first_non_none_value(row, candidates):
+    """
+    Try a list of candidate paths/keys (each can be str or list/tuple).
+    Returns (value, resolved_candidate) or (None, None).
+    """
+    for cand in candidates:
+        v = _get_path(row, cand)
+        if v is None and isinstance(cand, str) and cand in row:
+            v = row[cand]  # plain key access
+        if v is not None:
+            return v, cand
+    return None, None
 
 # ----------------------------- main executor ----------------------------------
 def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -703,73 +712,39 @@ def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str,
             ds = _ensure_datasets(account_id) if account_id else _ensure_datasets(None)
 
             if cap == "get_field":
-                ds = _ensure_datasets(account_id) if account_id else _ensure_datasets(None)
-
-                rows = ds.get(dom)
-                if rows is None:
-                    results[key] = {"error": f"No data for domain '{dom}'"}
-                    continue
-
-                # support single-object JSON (e.g., account_summary)
-                if isinstance(rows, dict):
-                    rows_list = [rows]
-                elif isinstance(rows, list):
-                    rows_list = rows
-                else:
-                    results[key] = {"error": f"Unsupported data type for domain '{dom}'"}
-                    continue
-
-                # optional account filter if accountId exists in the row
-                if account_id:
-                    filtered = [r for r in rows_list if
-                                str(r.get("accountId") or r.get("account_id")) == str(account_id)]
-                    rows_list = filtered or rows_list
-
-                if not rows_list:
-                    results[key] = {"error": "No matching rows"}
-                    continue
-
-                row = rows_list[0]
-
-                field = (args.get("field") or "").strip()
-                if not field:
+                field = args.get("field")
+                if field in (None, ""):
                     results[key] = {"error": "field is required"}
                     continue
 
-                # alias resolution
-                field_map = FIELD_ALIASES.get(dom, {})
-                key_name = field_map.get(field, field)
+                # load data set for domain (you already have ds = _ensure_datasets(...) above)
+                rows = ds.get(dom) or []
+                if isinstance(rows, dict):  # some domains may be a single dict
+                    rows = [rows]
 
-                # dotted-path getter (supports indices like persons[0].ownershipType)
-                def _get_path(d: dict, path: str):
-                    cur = d
-                    for part in path.replace("[", ".").replace("]", "").split("."):
-                        if not part:
-                            continue
-                        if isinstance(cur, list):
-                            try:
-                                cur = cur[int(part)]
-                            except Exception:
-                                return None
-                        elif isinstance(cur, dict):
-                            cur = cur.get(part)
-                        else:
-                            return None
-                    return cur
+                # build candidates: requested field + any alias you maintain
+                candidates = [field]
+                alias = FIELD_ALIASES.get(dom, {}).get(field) if 'FIELD_ALIASES' in globals() else None
+                if alias:
+                    candidates.append(alias)
 
-                value = _get_path(row, key_name)
-                if value is None and key_name in row:  # fallback if not dotted
-                    value = row[key_name]
+                found = None
+                resolved_key = None
+                chosen_row = None
 
-                if value is None and field != key_name and field in row:
-                    # final safety: if alias didn't hit but the raw field exists
-                    value = row[field]
+                for r in rows:
+                    val, res_key = _first_non_none_value(r, candidates)
+                    if val is not None:
+                        found = val
+                        resolved_key = res_key
+                        chosen_row = r
+                        break
 
-                if value is None:
-                    results[key] = {"value": None, "row": row, "field": field, "resolved_key": key_name,
-                                    "error": f"Field '{field}' not found"}
+                if found is not None:
+                    results[key] = {"value": found, "row": chosen_row, "field": field, "resolved_key": resolved_key}
                 else:
-                    results[key] = {"value": value, "row": row, "field": field, "resolved_key": key_name}
+                    # include the first row for debugging context if helpful
+                    results[key] = {"error": f"Field not found", "row": rows[0] if rows else None, "field": field}
                 continue
             elif cap == "find_latest":
                 res = _op_find_latest(dom, args, ds)  # implement similar helpers as needed
