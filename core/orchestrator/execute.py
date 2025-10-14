@@ -70,6 +70,183 @@ def _normalize_calls(calls: Any) -> List[Dict[str, Any]]:
         out.append(c)
     return out
 
+# --- put near the top of the file ----
+from typing import Any, Dict, List, Optional
+import json, re
+
+GENERIC_OPS = {"get_field", "find_latest", "sum_where", "topk_by_sum", "list_where", "semantic_search"}
+
+# tiny json-path getter: supports dot, [index]
+_PATH_TOKEN_RE = re.compile(r"\.|\[(\d+)\]")
+
+def _json_get(obj: Any, path: str) -> Any:
+    if not path:
+        return obj
+    cur = obj
+    # tokenize "a.b[0].c"
+    parts: List[str] = []
+    buf = ""
+    i = 0
+    while i < len(path):
+        if path[i] == "[":
+            # flush token
+            if buf:
+                parts.append(buf)
+                buf = ""
+            # read [num]
+            j = path.find("]", i)
+            if j == -1:
+                return None
+            parts.append(path[i:j+1])  # like "[0]"
+            i = j + 1
+        elif path[i] == ".":
+            if buf:
+                parts.append(buf)
+                buf = ""
+            i += 1
+        else:
+            buf += path[i]
+            i += 1
+    if buf:
+        parts.append(buf)
+
+    for p in parts:
+        if not p:
+            continue
+        if p.startswith("[") and p.endswith("]"):
+            # index
+            try:
+                idx = int(p[1:-1])
+                if isinstance(cur, list) and 0 <= idx < len(cur):
+                    cur = cur[idx]
+                else:
+                    return None
+            except Exception:
+                return None
+        else:
+            # dict key (case-insensitive fallback)
+            if isinstance(cur, dict):
+                if p in cur:
+                    cur = cur[p]
+                else:
+                    # case-insensitive / underscore fallback
+                    pl = p.lower().replace(" ", "").replace("_", "")
+                    found = None
+                    for k in cur.keys():
+                        if isinstance(k, str) and k.lower().replace(" ", "").replace("_", "") == pl:
+                            found = k
+                            break
+                    cur = cur.get(found) if found is not None else None
+            else:
+                return None
+    return cur
+
+# aliases for convenience — expand as needed
+FIELD_ALIASES = {
+    "account_summary": {
+        "status": ["accountStatus", "highestPriorityStatus", "balanceStatus"],
+        "balance_status": ["balanceStatus"],
+        "current_balance": ["currentBalance"],
+        "available_credit": ["availableCredit", "availableCreditLimit"],
+        "credit_limit": ["creditLimit"],
+    },
+    "transactions": {
+        "amount": ["amount"],
+        "posted": ["postedDateTime", "transactionDateTime", "date"],
+        "merchant": ["merchantName", "description"],
+    },
+    "payments": {
+        "posted": ["paymentPostedDateTime", "paymentDateTime", "date"],
+        "amount": ["amount"],
+    },
+    "statements": {
+        "period": ["period"],
+        "closing": ["closingDateTime"],
+        "interest": ["interestCharged"],
+    },
+}
+
+def _first_non_none(vals: List[Any]) -> Any:
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+def _op_get_field(dom: str, args: Dict[str, Any], ds: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Works across domains.
+    - For account_summary (single dict) → returns the value directly.
+    - For array domains (transactions/payments/statements) → by default returns the
+      value from the *latest* item (by typical date fields). You can override with:
+        args.item = "latest" | "first" | integer index
+        args.path = dotted or bracket path (e.g. "merchantName", "persons[0].ownershipType")
+    """
+    field = (args.get("field") or "").strip()
+    path  = (args.get("path")  or field or "").strip()
+    item  = (args.get("item")  or "latest")
+
+    if dom not in ds:
+        return {"error": f"Unknown domain {dom}"}
+
+    data = ds[dom]
+
+    # account_summary is usually a single dict
+    if dom == "account_summary" and isinstance(data, dict):
+        # 1) direct path
+        val = _json_get(data, path) if path else None
+        if val is None and field:
+            # 2) alias search
+            aliases = FIELD_ALIASES.get(dom, {}).get(field.lower(), [])
+            if aliases:
+                val = _first_non_none([_json_get(data, p) for p in aliases])
+        # 3) brute-force shallow case-insensitive match
+        if val is None and field:
+            fl = field.lower().replace("_", "")
+            for k, v in data.items():
+                if isinstance(k, str) and k.lower().replace("_", "") == fl:
+                    val = v
+                    break
+        return {"value": val}
+
+    # array domains
+    if isinstance(data, list) and data:
+        rows = data
+        # pick item
+        idx = None
+        if isinstance(item, int) or (isinstance(item, str) and item.isdigit()):
+            idx = int(item)
+        elif str(item).lower() == "first":
+            idx = 0
+        else:  # latest (default)
+            def _latest_key(r):
+                return (
+                    r.get("postedDateTime")
+                    or r.get("transactionDateTime")
+                    or r.get("paymentPostedDateTime")
+                    or r.get("paymentDateTime")
+                    or r.get("closingDateTime")
+                    or r.get("date")
+                    or ""
+                )
+            rows = sorted(rows, key=_latest_key, reverse=True)
+            idx = 0
+
+        if not (0 <= idx < len(rows)):
+            return {"error": f"Item index out of range: {idx}", "count": len(rows)}
+
+        row = rows[idx]
+        val = _json_get(row, path) if path else None
+        if val is None and field:
+            aliases = FIELD_ALIASES.get(dom, {}).get(field.lower(), [])
+            if aliases:
+                val = _first_non_none([_json_get(row, p) for p in aliases])
+            if val is None and field in row:
+                val = row[field]
+
+        return {"value": val, "row": row}
+
+    return {"error": f"No data for domain {dom}"}
+
 # ----------------- helpers -----------------
 
 from typing import Any, Dict, List, Tuple, Optional
@@ -79,6 +256,7 @@ _TS_KEYS = (
     "postedDateTime", "transactionDateTime", "paymentPostedDateTime",
     "paymentDateTime", "closingDateTime", "openingDateTime", "date",
 )
+
 
 def _pick_latest_row(rows: List[dict]) -> Optional[dict]:
     def _ts(row: dict) -> Optional[datetime]:
@@ -320,6 +498,114 @@ def _op_semantic_search_transactions(args: Dict[str, Any], index_dir: str, embed
     hits.sort(key=lambda x: x["score"], reverse=True)
     return {"hits": hits[:k], "trace": {"k": k, "query": q_raw, "alternates": alts}}
 
+
+# put near the top of execute.py if not already imported
+from core.index.faiss_registry import query_index
+
+def _row_id(dom: str, p: Dict[str, Any], h: Dict[str, Any]) -> str:
+    """Best-effort record id for de-dup across alternates."""
+    return (
+        p.get("transactionId")
+        or p.get("paymentId")
+        or p.get("statementId")
+        or p.get("id")
+        or str(h.get("idx"))
+    )
+
+def _passes_must_include(h: Dict[str, Any], tokens: List[str]) -> bool:
+    if not tokens:
+        return True
+    p = h.get("payload") or {}
+    blob = " ".join(
+        str(x)
+        for x in [
+            h.get("text", ""),
+            p.get("merchantName", ""),
+            p.get("description", ""),
+            p.get("displayTransactionType", ""),
+            p.get("category", ""),
+            p.get("period", ""),
+        ]
+        if x
+    ).lower()
+    return all(t.strip().lower() in blob for t in tokens if isinstance(t, str) and t.strip())
+
+def _op_semantic_search(
+    dom: str,
+    args: Dict[str, Any],
+    ds: Dict[str, Any],
+    index_dir: str,
+    embedder,          # whatever you built earlier via your config (Embedder/OpenAI)
+) -> Dict[str, Any]:
+    """
+    Embedding search against the FAISS index for the given domain.
+    Args supported:
+      - query: str (required)
+      - alternates: List[str] (optional)
+      - must_include: List[str] (optional lowercase tokens that MUST appear)
+      - account_id: str (optional; filters payload.accountId)
+      - k: int (top-K to return; default 6)
+    """
+    q_raw = (args.get("query") or args.get("category") or args.get("merchant_query") or "").strip()
+    if not q_raw:
+        return {"hits": [], "error": "query is required", "trace": {"domain": dom}}
+
+    alts = [a for a in (args.get("alternates") or []) if isinstance(a, str) and a.strip()]
+    must = [t for t in (args.get("must_include") or []) if isinstance(t, str) and t.strip()]
+    k = max(1, int(args.get("k", 6)))
+    aid = (args.get("account_id") or "").strip()
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    queries = [q_raw] + alts[:8]  # cap alternates to keep it cheap
+
+    for q in queries:
+        try:
+            hits = query_index(
+                domain=dom,
+                query=q,
+                top_k=k,
+                index_dir=index_dir,
+                embedder=embedder,
+            )
+        except FileNotFoundError as e:
+            return {"hits": [], "error": f"Index not found for domain '{dom}': {e}", "trace": {"domain": dom}}
+        except Exception as e:
+            return {"hits": [], "error": f"semantic_search failed: {e}", "trace": {"domain": dom}}
+
+        for h in hits or []:
+            p = h.get("payload") or {}
+            # optional account filter
+            if aid and p.get("accountId") != aid:
+                continue
+            # must_include tokens
+            if not _passes_must_include(h, must):
+                continue
+
+            rid = _row_id(dom, p, h)
+            score = float(h.get("score", 0.0))
+            prev = merged.get(rid)
+            if (prev is None) or (score > prev.get("score", 0.0)):
+                merged[rid] = {
+                    "score": score,
+                    "text": h.get("text"),
+                    "payload": p,
+                    "matched_query": q,
+                }
+
+    out = list(merged.values())
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "hits": out[:k],
+        "trace": {
+            "domain": dom,
+            "query": q_raw,
+            "alternates": alts,
+            "must_include": must,
+            "filtered_by_account": bool(aid),
+            "returned": min(k, len(out)),
+        },
+    }
+
 # ----------------------------- main executor ----------------------------------
 def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -357,19 +643,50 @@ def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str,
         return ds
 
     for i, call in enumerate(calls or []):
+        # 1) normalize the call safely
+        if isinstance(call, str):
+            try:
+                call = json.loads(call)
+            except Exception:
+                results[f"call[{i}]"] = {"error": "malformed call"}
+                continue
+
         dom = str(call.get("domain_id", "")).strip().lower().replace("-", "_")
         cap = str(call.get("capability", "")).strip().lower().replace("-", "_")
         args = dict(call.get("args") or {})
-        key  = f"{dom}.{cap}[{i}]"
+        key = f"{dom}.{cap}[{i}]"
 
-        # pick account_id when relevant
+        # optional account_id (used by ensure_datasets)
         account_id = args.get("account_id") or (cfg or {}).get("account_id")
 
-        # ---------- RAG lane ONLY when domain_id == "rag" ----------
+        # 2) ---- Generic 5-op DSL FIRST -----------------------------------------
+        if cap in GENERIC_OPS:
+            # load datasets (transactions/payments/statements/account_summary)
+            ds = _ensure_datasets(account_id) if account_id else _ensure_datasets(None)
+
+            if cap == "get_field":
+                res = _op_get_field(dom, args, ds)
+            elif cap == "find_latest":
+                res = _op_find_latest(dom, args, ds)  # implement similar helpers as needed
+            elif cap == "sum_where":
+                res = _op_sum_where(dom, args, ds)
+            elif cap == "topk_by_sum":
+                res = _op_topk_by_sum(dom, args, ds)
+            elif cap == "list_where":
+                res = _op_list_where(dom, args, ds)
+            elif cap == "semantic_search":
+                res = _op_semantic_search(dom, args, ds, index_dir, embedder)
+            else:
+                res = {"error": f"Unsupported op {cap}"}
+
+            results[key] = res
+            continue  # IMPORTANT: do not fall through
+
+        # 3) ---- RAG lane (explicit) ---------------------------------------------
         if dom == "rag":
             k = int(args.get("k", 6))
             try:
-                if cap in {"unified_answer", "unified"}:
+                if cap in ("unified_answer", "unified"):
                     if not account_id:
                         res = {"error": "account_id is required for rag.unified_answer"}
                     else:
@@ -379,7 +696,7 @@ def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str,
                             account_id=account_id,
                             k=k,
                         )
-                elif cap in {"account_answer", "account_only"}:
+                elif cap in ("account_answer", "account_only"):
                     if not account_id:
                         res = {"error": "account_id is required for rag.account_answer"}
                     else:
@@ -389,49 +706,26 @@ def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str,
                             account_id=account_id,
                             k=k,
                         )
-                elif cap in {"knowledge_answer", "policy_answer", "handbook_answer"}:
+                elif cap in ("knowledge_answer", "policy_answer", "handbook_answer"):
                     res = knowledge_rag_answer(
                         question=question,
                         session_id=session_id,
                         k=k,
                     )
                 else:
-                    res = {"error": f"Unknown rag capability: {cap}"}
+                    res = {"error": f"Unknown rag capability '{cap}'"}
             except FileNotFoundError as e:
                 res = {"error": f"Index not found: {e}"}
             except Exception as e:
                 res = {"error": f"RAG execution error: {e}"}
 
             results[key] = res
-            continue  # do not fall through
-
-        # ---------- Generic DSL lane (NO legacy, NO RAG fallback) ----------
-        if cap in {"get_field", "find_latest", "sum_where", "topk_by_sum", "list_where", "semantic_search"}:
-            ds = _ensure_datasets(account_id)  # your existing loader bundle
-            try:
-                if cap == "get_field":
-                    res = _op_get_field(dom, args, ds)
-                elif cap == "find_latest":
-                    # (optional) you can add a tiny generic impl if you need it
-                    res = {"error": "find_latest not implemented"}
-                elif cap == "sum_where":
-                    res = {"error": "sum_where not implemented"}
-                elif cap == "topk_by_sum":
-                    res = {"error": "topk_by_sum not implemented"}
-                elif cap == "list_where":
-                    res = {"error": "list_where not implemented"}
-                elif cap == "semantic_search":
-                    # keep your FAISS semantic search here if you already had it
-                    res = {"error": "semantic_search not implemented"}
-                else:
-                    res = {"error": f"Unknown DSL capability: {cap}"}
-            except Exception as e:
-                res = {"error": f"DSL execution error: {e}"}
-
-            results[key] = res
             continue
 
-        # ---------- Unknown domain/op (explicit) ----------
+        # 4) ---- If you still want legacy calculators, put them here -------------
+        # elif dom == "transactions": ... etc.
+
+        # 5) ---- Unknown ----------------------------------------------------------
         results[key] = {"error": f"Unknown capability {cap} for domain {dom}"}
 
     return results
