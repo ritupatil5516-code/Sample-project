@@ -606,52 +606,90 @@ def _op_semantic_search(
         },
     }
 
-# dotted / bracket path getter that also supports list/tuple parts
-def _get_path(obj, path):
+def _norm_key(s: str) -> str:
+    """lowercase and remove non-alnum to compare keys loosely"""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+def _load_domain_rows(account_id: str, domain: str) -> List[Dict[str, Any]]:
     """
-    Robust getter that supports:
-      - "persons[0].ownershipType"
-      - "persons.0.ownershipType"
-      - ["persons", 0, "ownershipType"]
+    Loads JSON for one domain:
+      account_summary.json | transactions.json | payments.json | statements.json
+    Always returns a list of dict rows.
+    """
+    p = CUSTOMER_DATA_DIR / account_id / f"{domain}.json"
+    if not p.exists():
+        return []
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        # ensure only dict rows; if primitives slip in, wrap them
+        return [r if isinstance(r, dict) else {"value": r} for r in data]
+    return []
+
+def _get_path(obj: Any, path: Any) -> Any:
+    """
+    Path getter that supports:
+      - "a.b.c", "a[0].b", "a.0.b"
+      - ["a", 0, "b"]
+    Returns None if any hop missing.
     """
     # normalize to parts
     if isinstance(path, (list, tuple)):
         parts = list(path)
     else:
-        s = str(path)
-        s = s.replace('[', '.').replace(']', '')
-        parts = [p for p in s.split('.') if p]
+        s = str(path).replace("[", ".").replace("]", "")
+        parts = [p for p in s.split(".") if p]
 
     cur = obj
     for part in parts:
         if isinstance(cur, list):
             try:
-                idx = part if isinstance(part, int) else int(str(part))
+                idx = int(part)
                 cur = cur[idx]
             except Exception:
                 return None
         elif isinstance(cur, dict):
             key = part if isinstance(part, str) else str(part)
-            cur = cur.get(key)
+            if key in cur:
+                cur = cur[key]
+            else:
+                return None
         else:
-            return None
-        if cur is None:
             return None
     return cur
 
+def _find_value(rows: List[Dict[str, Any]], domain: str, field: Any) -> Tuple[Optional[Any], Optional[Dict[str, Any]], Optional[Any]]:
+    """
+    Tries, in order:
+      1) exact path the planner gave (string or list)
+      2) domain alias (e.g., status → accountStatus)
+      3) crude loose key match on the top level (status ≈ accountStatus)
+    Returns (value, row, resolved_key) or (None, None, None)
+    """
+    candidates: List[Any] = [field]
+    alias_map = FIELD_ALIASES.get(domain, {})
+    if isinstance(field, str):
+        alias = alias_map.get(field)
+        if alias and alias != field:
+            candidates.append(alias)
 
-def _first_non_none_value(row, candidates):
-    """
-    Try a list of candidate paths/keys (each can be str or list/tuple).
-    Returns (value, resolved_candidate) or (None, None).
-    """
-    for cand in candidates:
-        v = _get_path(row, cand)
-        if v is None and isinstance(cand, str) and cand in row:
-            v = row[cand]  # plain key access
-        if v is not None:
-            return v, cand
-    return None, None
+    # 1/2) try exact + alias paths
+    for r in rows:
+        for cand in candidates:
+            v = _get_path(r, cand)
+            if v is not None:
+                return v, r, cand
+
+    # 3) loose top-level key match if field is simple string
+    if isinstance(field, str) and ("." not in field and "[" not in field):
+        nf = _norm_key(field)
+        for r in rows:
+            for k, v in r.items():
+                if _norm_key(k) == nf:
+                    return v, r, k
+
+    return None, None, None
 
 # ----------------------------- main executor ----------------------------------
 def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -712,39 +750,31 @@ def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str,
             ds = _ensure_datasets(account_id) if account_id else _ensure_datasets(None)
 
             if cap == "get_field":
+                account_id = args.get("account_id") or cfg.get("account_id")  # keep your cfg fallback if you use it
                 field = args.get("field")
+                if not account_id:
+                    results[key] = {"error": "account_id is required for get_field"}
+                    continue
                 if field in (None, ""):
                     results[key] = {"error": "field is required"}
                     continue
 
-                # load data set for domain (you already have ds = _ensure_datasets(...) above)
-                rows = ds.get(dom) or []
-                if isinstance(rows, dict):  # some domains may be a single dict
-                    rows = [rows]
+                # domain is `dom` from your loop (e.g., "account_summary")
+                rows = _load_domain_rows(account_id, dom)
+                if not rows:
+                    results[key] = {"error": f"No data for domain '{dom}'", "account_id": account_id}
+                    continue
 
-                # build candidates: requested field + any alias you maintain
-                candidates = [field]
-                alias = FIELD_ALIASES.get(dom, {}).get(field) if 'FIELD_ALIASES' in globals() else None
-                if alias:
-                    candidates.append(alias)
-
-                found = None
-                resolved_key = None
-                chosen_row = None
-
-                for r in rows:
-                    val, res_key = _first_non_none_value(r, candidates)
-                    if val is not None:
-                        found = val
-                        resolved_key = res_key
-                        chosen_row = r
-                        break
-
-                if found is not None:
-                    results[key] = {"value": found, "row": chosen_row, "field": field, "resolved_key": resolved_key}
+                value, row, resolved = _find_value(rows, dom, field)
+                if value is None:
+                    results[key] = {
+                        "error": "Field not found",
+                        "field": field,
+                        "resolved_key": resolved,
+                        "sample_row": rows[0] if rows else None,
+                    }
                 else:
-                    # include the first row for debugging context if helpful
-                    results[key] = {"error": f"Field not found", "row": rows[0] if rows else None, "field": field}
+                    results[key] = {"value": value, "row": row, "field": field, "resolved_key": resolved}
                 continue
             elif cap == "find_latest":
                 res = _op_find_latest(dom, args, ds)  # implement similar helpers as needed
