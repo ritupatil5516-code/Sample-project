@@ -5,7 +5,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="8995c3af-8f90-402c-86b4-9fc976f7a0d7" name="Changes" comment="changes">
+      <change afterPath="$PROJECT_DIR$/info.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/dsl_ops.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/dsl_ops.py" afterDir="false" />
     </list>
     <list id="571996ee-ce96-4316-a5ad-ffa6ec27a835" name="local" comment="local">
       <change beforePath="$PROJECT_DIR$/.env" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
@@ -435,7 +437,15 @@
       <option name="project" value="LOCAL" />
       <updated>1760460520403</updated>
     </task>
-    <option name="localTasksCounter" value="38" />
+    <task id="LOCAL-00038" summary="changes">
+      <option name="closed" value="true" />
+      <created>1760460799546</created>
+      <option name="number" value="00038" />
+      <option name="presentableId" value="LOCAL-00038" />
+      <option name="project" value="LOCAL" />
+      <updated>1760460799546</updated>
+    </task>
+    <option name="localTasksCounter" value="39" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -464,12 +474,12 @@
       <breakpoints>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/core/orchestrator/execute.py</url>
-          <line>720</line>
+          <line>234</line>
           <option name="timeStamp" value="2" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/core/orchestrator/execute.py</url>
-          <line>479</line>
+          <line>180</line>
           <option name="timeStamp" value="3" />
         </line-breakpoint>
       </breakpoints>
