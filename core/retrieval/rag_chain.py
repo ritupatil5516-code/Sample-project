@@ -20,20 +20,25 @@ def _llm_from_cfg():
     model = os.getenv("CHAT_MODEL", "gpt-4o-mini")
     return ChatOpenAI(model=model, temperature=0)
 
-def _load_index(persist_dir: Path):
-    if not persist_dir.exists():
-        raise FileNotFoundError(f"Missing index at {persist_dir}. Build indexes at startup.")
-    sc = StorageContext.from_defaults(persist_dir=str(persist_dir))
-    return load_index_from_storage(sc)
+def _load_index(persist_dir: str | Path) -> VectorStoreIndex:
+    persist_dir = Path(persist_dir).resolve()
+    storage = StorageContext.from_defaults(persist_dir=str(persist_dir))
+    # vector store will be reconstructed from persisted state; no need to pass dim
+    return VectorStoreIndex.from_vector_store(
+        vector_store=FaissVectorStore.from_persist_dir(persist_dir=str(persist_dir))
+    )
 
-def ensure_account_retriever(account_id: str, top_k: int = 6):
-    idx = _load_index(INDEXES_DIR / account_id)
-    return idx.as_langchain_retriever(similarity_top_k=top_k)
+def ensure_knowledge_retriever(index_root="var/indexes", k=6):
+    idx_dir = Path(index_root) / "knowledge"
+    index = _load_index(idx_dir)
+    return index.as_retriever(similarity_top_k=k)
 
-def ensure_knowledge_retriever(top_k: int = 6):
-    idx = _load_index(KNOWLEDGE_INDEX)
-    return idx.as_langchain_retriever(similarity_top_k=top_k)
-
+def ensure_account_retriever(account_id: str, index_root="var/indexe"
+                                                         ""
+                                                         "s", k=6):
+    idx_dir = Path(index_root) / "accounts" / account_id
+    index = _load_index(idx_dir)
+    return index.as_retriever(similarity_top_k=k)
 def _crc(llm, retriever, session_id: str):
     mem = MEMORY.get(session_id)  # returns a ConversationBufferWindowMemory(k=10, …)
     return ConversationalRetrievalChain.from_llm(
