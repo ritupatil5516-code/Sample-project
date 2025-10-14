@@ -1,69 +1,92 @@
 # core/retrieval/knowledge_ingest.py
 from __future__ import annotations
-
 from pathlib import Path
-from typing import Sequence, Dict, Any, List
+from typing import Iterable, List, Optional, Sequence, Union
 
-from llama_index.core import Document, VectorStoreIndex, StorageContext, Settings
-from llama_index.core.readers import SimpleDirectoryReader
-from llama_index.vector_stores.faiss import FaissVectorStore
 import faiss
+from llama_index.core import SimpleDirectoryReader, VectorStoreIndex
+from llama_index.core import StorageContext, Document
+from llama_index.vector_stores.faiss import FaissVectorStore
+
+PathLike = Union[str, Path]
 
 
 def _embed_dim() -> int:
     """
-    Try to read the embedding dimension from the configured embed model.
-    Fall back to 1536 if not available.
+    Return the embedding dimension you use elsewhere.
+    If you use OpenAI text-embedding-3-large -> 3072; text-embedding-3-small -> 1536.
+    Adjust if needed.
     """
-    return int(getattr(Settings.embed_model, "embed_dim", 1536))
+    return 1536
+
+
+def _collect_files(
+    files: Optional[Sequence[PathLike]] = None,
+    knowledge_dir: Optional[PathLike] = None,
+    exts: Optional[Sequence[str]] = (".md", ".txt", ".pdf"),
+) -> List[Path]:
+    exts = tuple(exts or ())
+    out: List[Path] = []
+
+    if files:
+        for f in files:
+            p = Path(f)
+            if p.is_file() and (not exts or p.suffix.lower() in exts):
+                out.append(p)
+
+    elif knowledge_dir:
+        root = Path(knowledge_dir)
+        if root.exists():
+            for p in root.rglob("*"):
+                if p.is_file() and (not exts or p.suffix.lower() in exts):
+                    out.append(p)
+
+    return out
 
 
 def ensure_knowledge_index(
-    knowledge_dir: str | Path,
-    persist_dir: str | Path,
-    files: Sequence[str | Path] | None = None,
-) -> Dict[str, Any]:
+    persist_dir: PathLike,
+    *,
+    files: Optional[Sequence[PathLike]] = None,
+    knowledge_dir: Optional[PathLike] = None,
+) -> dict:
     """
-    Build (or reuse) a FAISS-backed index over knowledge files (handbook, agreement, FAQs, etc.)
+    Build (or rebuild) a FAISS knowledge index from either a `files` list or a `knowledge_dir`.
 
-    Parameters
-    ----------
-    knowledge_dir : str | Path
-        Directory that contains knowledge files (used if `files` is None).
-    persist_dir : str | Path
-        Where to persist the FAISS + storage artifacts.
-    files : Sequence[str | Path] | None
-        Optional explicit list of files to index. Must be an iterable.
-        Example: [Path("data/knowledge/handbook.md"), Path("data/agreement/Apple-Card.pdf")]
+    Args:
+        persist_dir: folder where the FAISS + docstore artifacts are written.
+        files: specific files to include (preferred exact control).
+        knowledge_dir: directory to crawl for *.md/*.txt/*.pdf (used if `files` is None).
 
-    Returns
-    -------
-    Dict[str, Any]
-        Meta about the built index: count, persist_dir, dim.
+    Returns:
+        dict meta with count, dim, and persist_dir.
     """
-    knowledge_dir = Path(knowledge_dir).resolve()
-    persist_dir = Path(persist_dir).resolve()
-    persist_dir.mkdir(parents=True, exist_ok=True)
+    persist_path = Path(persist_dir)
+    persist_path.mkdir(parents=True, exist_ok=True)
 
-    # ---- Load documents
-    if files:
-        # IMPORTANT: must be an iterable; pass absolute file paths
-        input_files = [str(Path(f).resolve()) for f in files]
-        reader = SimpleDirectoryReader(input_files=input_files)
-    else:
-        reader = SimpleDirectoryReader(input_dir=str(knowledge_dir))
+    picked = _collect_files(files=files, knowledge_dir=knowledge_dir)
+    if not picked:
+        # nothing to index; leave quietly
+        return {"count": 0, "dim": _embed_dim(), "persist_dir": str(persist_path)}
 
+    # Read documents
+    # Use input_files to avoid directory readers creating nested metadata surprises.
+    reader = SimpleDirectoryReader(input_files=[str(p) for p in picked])
     docs: List[Document] = reader.load_data()
 
-    # ---- Build FAISS store
+    # Build FAISS-backed index
     dim = _embed_dim()
-    faiss_index = faiss.IndexFlatIP(dim)  # use cosine-sim via inner product; change to L2 if you prefer
+    faiss_index = faiss.IndexFlatIP(dim)
     vector_store = FaissVectorStore(faiss_index=faiss_index)
+    storage = StorageContext.from_defaults(vector_store=vector_store)
 
-    storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(persist_dir))
+    index = VectorStoreIndex.from_documents(
+        docs,
+        storage_context=storage,
+        show_progress=True,
+    )
 
-    # ---- Create index & persist
-    index = VectorStoreIndex.from_documents(docs, storage_context=storage, show_progress=True)
-    storage.persist(persist_dir=str(persist_dir))
+    # Persist artifacts (docstore.json, index files, etc.)
+    index.storage_context.persist(persist_dir=str(persist_path))
 
-    return {"count": len(docs), "persist_dir": str(persist_dir), "dim": dim}
+    return {"count": len(docs), "dim": dim, "persist_dir": str(persist_path)}
