@@ -9,7 +9,6 @@ from langchain.memory import ConversationBufferWindowMemory
 from langchain.schema import Document as LCDocument
 from langchain.retrievers import BaseRetriever
 
-# --- Your ingestion utilities (already working) ---
 from core.retrieval.json_ingest import ensure_account_retriever
 from core.retrieval.knowledge_ingest import ensure_knowledge_retriever
 
