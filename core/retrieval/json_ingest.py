@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List
 
-from llama_index.core import Document, VectorStoreIndex, StorageContext, Settings
+from llama_index.core import Document, VectorStoreIndex, StorageContext, Settings, load_index_from_storage
 from llama_index.vector_stores.faiss import FaissVectorStore
 import faiss
 import json
@@ -29,6 +29,23 @@ def _load_json(path: Path) -> List[Dict[str, Any]]:
         return [data]
     return []
 
+def load_account_index(persist_dir: str):
+    """
+    Load an account index persisted by LlamaIndex.
+    persist_dir should be the *llama* subfolder, not the account root.
+    """
+    p = Path(persist_dir)
+    vector_store = FaissVectorStore.from_persist_dir(str(p))
+    storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(p))
+    return load_index_from_storage(storage)
+
+# core/retrieval/knowledge_ingest.py
+
+def load_knowledge_index(persist_dir: str):
+    p = Path(persist_dir)
+    vector_store = FaissVectorStore.from_persist_dir(str(p))
+    storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(p))
+    return load_index_from_storage(storage)
 
 def build_account_index(
     account_id: str,
