@@ -1,35 +1,72 @@
 # core/retrieval/rag_chain.py
 from __future__ import annotations
-
 from typing import Dict, Any, List, Optional
 import os
 
-# --- LangChain v0.2+ imports (with graceful fallbacks) ---
+# ----------------- LangChain imports (robust across versions) -----------------
 try:
-    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-    from langchain_core.output_parsers import StrOutputParser
-    from langchain_core.runnables import RunnablePassthrough, RunnableParallel
-    from langchain_core.messages import AIMessage, HumanMessage
-    from langchain.memory import ConversationBufferWindowMemory
-    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-except Exception:  # older versions
-    from langchain.prompts import ChatPromptTemplate
-    from langchain_core.prompts import MessagesPlaceholder  # might still exist
-    from langchain.output_parsers import StrOutputParser
-    from langchain.schema.runnable import RunnablePassthrough
-    from langchain.memory import ConversationBufferWindowMemory
-    from langchain.chat_models import ChatOpenAI  # older
-    from langchain.embeddings import OpenAIEmbeddings
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+except Exception:
+    # Fallback shims if needed
+    class AIMessage:
+        def __init__(self, content: str): self.content = content
+    class HumanMessage:
+        def __init__(self, content: str): self.content = content
+    class SystemMessage:
+        def __init__(self, content: str): self.content = content
 
-# If you adapt LlamaIndex retrievers to LangChain, import your ensure_* functions:
-# (Assuming you already implemented these to return LangChain-compatible Retrievers)
+# Chat model
+try:
+    from langchain_openai import ChatOpenAI
+except Exception:
+    # Older path
+    from langchain.chat_models import ChatOpenAI  # type: ignore
+
+# Memory (robust import + fallback)
+try:
+    from langchain.memory import ConversationBufferWindowMemory
+except Exception:
+    # Minimal drop-in replacement with the subset of features we use
+    class ConversationBufferWindowMemory:  # type: ignore
+        def __init__(self, k: int = 10, memory_key: str = "chat_history",
+                     return_messages: bool = True, output_key: Optional[str] = None):
+            self.k = k
+            self.memory_key = memory_key
+            self.return_messages = return_messages
+            self.output_key = output_key
+            self._msgs: List[Any] = []
+
+            class _ChatMemory:
+                def __init__(self, outer): self.outer = outer
+                def add_user_message(self, text: str): outer._append(("human", text))
+                def add_ai_message(self, text: str):   outer._append(("ai", text))
+            self.chat_memory = _ChatMemory(self)
+
+        def _append(self, item):
+            self._msgs.append(item)
+            self._msgs = self._msgs[-(2 * self.k):]
+
+        def load_memory_variables(self, _) -> Dict[str, Any]:
+            hist: List[Any] = []
+            for role, text in self._msgs[-(2 * self.k):]:
+                try:
+                    if role == "human":
+                        hist.append(HumanMessage(content=text))
+                    else:
+                        hist.append(AIMessage(content=text))
+                except Exception:
+                    hist.append((role, text))
+            return {self.memory_key: hist}
+
+# Your retrievers (must be LangChain-compatible retrievers)
 from core.retrieval.json_ingest import ensure_account_retriever
 from core.retrieval.knowledge_ingest import ensure_knowledge_retriever
 
-# Simple in-process memory store keyed by session_id.
-# For multi-process use Redis or a DB-backed chat message store.
-_MEMORY_BY_SESSION: Dict[str, ConversationBufferWindowMemory] = {}
+# Per-session memory cache (avoid referencing class in type annotation for safety)
+_MEMORY_BY_SESSION = {}  # type: Dict[str, ConversationBufferWindowMemory]
 
+
+# -------------------------- helpers --------------------------
 
 def _get_llm(cfg: Dict[str, Any]) -> ChatOpenAI:
     llm_cfg = (cfg.get("llm") or {})
@@ -41,24 +78,11 @@ def _get_llm(cfg: Dict[str, Any]) -> ChatOpenAI:
     if api_base and not (api_base.startswith("http://") or api_base.startswith("https://")):
         api_base = "https://" + api_base
 
-    # ChatOpenAI (langchain_openai) supports base_url param name; older uses openai_api_base
+    # langchain_openai (new) vs older signature
     try:
         return ChatOpenAI(model=model, api_key=api_key, base_url=api_base, temperature=0)
     except TypeError:
-        # fallback older signature
         return ChatOpenAI(model_name=model, openai_api_key=api_key, openai_api_base=api_base, temperature=0)
-
-
-def _format_docs(docs) -> str:
-    parts = []
-    for d in docs or []:
-        try:
-            meta = d.metadata if hasattr(d, "metadata") else {}
-            src = meta.get("source") or meta.get("path") or meta.get("file") or ""
-            parts.append(f"[{src}]\n{d.page_content}")
-        except Exception:
-            parts.append(getattr(d, "page_content", str(d)))
-    return "\n\n---\n\n".join(parts)
 
 
 def _get_memory(session_id: str, k: int = 10) -> ConversationBufferWindowMemory:
@@ -67,96 +91,66 @@ def _get_memory(session_id: str, k: int = 10) -> ConversationBufferWindowMemory:
         return mem
     mem = ConversationBufferWindowMemory(
         k=k,
-        memory_key="chat_history",  # this name is used in the prompt below
+        memory_key="chat_history",
         return_messages=True,
-        output_key="answer",  # helpful if chain returns dict
+        output_key="answer",
     )
     _MEMORY_BY_SESSION[session_id] = mem
     return mem
 
 
-def build_unified_rag_chain(cfg: Dict[str, Any],
-                            account_id: Optional[str]) -> Any:
-    """
-    Build a conversational RAG chain that pulls from:
-      - account retriever (JSON-derived vectors) for this account_id
-      - knowledge retriever (handbook + agreement)
-    Then merges results and passes to the LLM with memory.
-    """
-    llm = _get_llm(cfg)
-
-    # Retrievers (LangChain-compatible)
-    acc_ret = ensure_account_retriever(account_id)
-    knw_ret = ensure_knowledge_retriever()
-
-    # Merge two retrievers: retrieve from both, then concat and de-dup
-    # RunnableParallel lets us run both in parallel in LCEL.
-    parallel = RunnableParallel(acc=acc_ret, knw=knw_ret)
-
-    def _merge_retrieval(inputs: Dict[str, Any]):
-        """LCEL function to combine results from both retrievers."""
-        # inputs == {"question": "..."} from RunnablePassthrough
-        q = inputs.get("question") or inputs.get("input") or ""
-        fetched = parallel.invoke(q)
-        acc_docs = fetched.get("acc") or []
-        knw_docs = fetched.get("knw") or []
-        # simple concat; could add scoring/weights here
-        combined = acc_docs + knw_docs
-        # (optional) truncate to top-k here if necessary; retrievers usually handle k
-        return {"context": _format_docs(combined), "question": q}
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are a precise banking copilot. "
-         "Answer ONLY from the provided context. "
-         "If the context is insufficient, say 'I don't know'. "
-         "Be concise and factual."),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "{question}"),
-        ("system", "Context:\n{context}")
-    ])
-
-    # LCEL: question passthrough -> merged retrieval -> prompt -> llm -> text
-    chain = (
-        RunnablePassthrough()
-        | _merge_retrieval
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
-    return chain
-
-
-def _safe_invoke(chain: Any,
-                 question: str,
-                 memory: ConversationBufferWindowMemory,
-                 chat_history: Optional[List] = None) -> str:
-    """
-    Invoke chain defensively across LangChain variants / input schemas.
-    """
-    # coerce chat_history for prompt (MessagesPlaceholder wants LC messages)
-    if chat_history is None:
-        chat_history = memory.load_memory_variables({}).get("chat_history") or []
-    # The LCEL chain takes a dict with "question" and we inject chat_history via config.
-    inputs = {"question": question}
-    try:
-        # Try standard .invoke with prompt vars in inputs and history in "configurable" metadata
-        return chain.invoke(
-            inputs,
-            config={"configurable": {"chat_history": chat_history}}
-        )
-    except Exception as e1:
-        # Try packing history directly into inputs
+def _format_docs(docs) -> str:
+    parts = []
+    for d in docs or []:
         try:
-            return chain.invoke({"question": question, "chat_history": chat_history})
-        except Exception as e2:
-            # Try alternate key "input"
-            try:
-                return chain.invoke({"input": question, "chat_history": chat_history})
-            except Exception:
-                # Bubble the first error; it’s the closest to the true cause
-                raise e1
+            meta = d.metadata if hasattr(d, "metadata") else {}
+            src = meta.get("source") or meta.get("path") or meta.get("file") or ""
+            parts.append(f"[{src}]\n{getattr(d, 'page_content', str(d))}")
+        except Exception:
+            parts.append(getattr(d, "page_content", str(d)))
+    return "\n\n---\n\n".join(parts)
 
+
+def _pull_docs(retriever: Any, question: str) -> List[Any]:
+    """Call retriever in a version-safe way."""
+    if retriever is None:
+        return []
+    # Prefer .invoke for LCEL retrievers
+    try:
+        docs = retriever.invoke(question)
+        if isinstance(docs, list):
+            return docs
+    except Exception:
+        pass
+    # Classic retriever API
+    try:
+        docs = retriever.get_relevant_documents(question)
+        if isinstance(docs, list):
+            return docs
+    except Exception:
+        pass
+    # LlamaIndex adapter might expose .retrieve()
+    try:
+        out = retriever.retrieve(question)
+        # Some adapters return objects with .node.text
+        docs = []
+        for item in out:
+            text = getattr(item, "text", None)
+            if text is None and hasattr(item, "node"):
+                text = getattr(item.node, "text", None) or getattr(item.node, "get_content", lambda: "")()
+            if text:
+                class _Doc:
+                    def __init__(self, page_content, metadata=None):
+                        self.page_content = page_content
+                        self.metadata = metadata or {}
+                docs.append(_Doc(text, {}))
+        return docs
+    except Exception:
+        pass
+    return []
+
+
+# ------------------------- public API --------------------------
 
 def unified_rag_answer(question: str,
                        session_id: str,
@@ -164,27 +158,52 @@ def unified_rag_answer(question: str,
                        cfg: Dict[str, Any],
                        k: int = 6) -> Dict[str, Any]:
     """
-    Public entry for executor: builds chain, invokes safely, records memory,
-    and normalizes output shape.
-    Returns: {"answer": str, "sources": []}
+    Simpler, version-agnostic conversational RAG:
+      - Fetch docs from account + knowledge retrievers sequentially
+      - Build a minimal chat prompt with memory and context
+      - Call the LLM directly
+    Returns {"answer": str, "sources": []}
     """
-    # Build/obtain chain
-    chain = build_unified_rag_chain(cfg, account_id=account_id)
-
-    # Memory
+    # LLM and memory
+    llm = _get_llm(cfg)
     mem = _get_memory(session_id, k=10)
-    # Save the user question to memory first (some memory backends append after)
-    mem.chat_memory.add_user_message(question)
 
-    # Run
-    text = _safe_invoke(chain, question, memory=mem)
+    # Prepare chat history (LangChain message objects if available)
+    chat_history = mem.load_memory_variables({}).get("chat_history") or []
 
-    # Save assistant reply into memory
-    mem.chat_memory.add_ai_message(text)
+    # Retrievers
+    acc_ret = ensure_account_retriever(account_id)
+    knw_ret = ensure_knowledge_retriever()
 
-    # Normalize shape expected by compose/execute
-    return {
-        "answer": text,
-        # If you need sources, modify _merge_retrieval to also return doc metadata.
-        "sources": []
-    }
+    # Retrieve docs (no RunnableParallel)
+    acc_docs = _pull_docs(acc_ret, question)
+    knw_docs = _pull_docs(knw_ret, question)
+    context = _format_docs(acc_docs + knw_docs)
+
+    # Compose prompt
+    sys_a = SystemMessage(
+        content=(
+            "You are a precise banking copilot. Answer ONLY from the provided context. "
+            "If the context is insufficient, say 'I don't know'. Be concise and factual."
+        )
+    )
+    sys_ctx = SystemMessage(content=f"Context:\n{context}") if context else SystemMessage(content="Context:\n")
+    user = HumanMessage(content=question)
+
+    messages = [sys_a] + chat_history + [user, sys_ctx]
+
+    # Invoke model
+    try:
+        resp = llm.invoke(messages)
+        text = getattr(resp, "content", str(resp))
+    except Exception as e:
+        text = f"(RAG error: {type(e).__name__}: {e})"
+
+    # Update memory
+    try:
+        mem.chat_memory.add_user_message(question)
+        mem.chat_memory.add_ai_message(text)
+    except Exception:
+        pass
+
+    return {"answer": text, "sources": []}
