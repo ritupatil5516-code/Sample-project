@@ -1,56 +1,69 @@
 # core/retrieval/knowledge_ingest.py
 from __future__ import annotations
+
 from pathlib import Path
-from typing import List
-import os
+from typing import Sequence, Dict, Any, List
 
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.document_loaders import TextLoader
-from langchain_community.vectorstores import FAISS
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from llama_index.core import Document, VectorStoreIndex, StorageContext, Settings
+from llama_index.core.readers import SimpleDirectoryReader
+from llama_index.vector_stores.faiss import FaissVectorStore
+import faiss
 
-def _read_cfg():
-    import yaml, json
-    p = Path("config/app.yaml")
-    return (yaml.safe_load(p.read_text(encoding="utf-8")) if p.exists() else {})
 
-def _load_source_dir(root:Path) -> List[str]:
-    files = []
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in (".md",".txt",".json"):
-            files.append(p.as_posix())
-    return files
+def _embed_dim() -> int:
+    """
+    Try to read the embedding dimension from the configured embed model.
+    Fall back to 1536 if not available.
+    """
+    return int(getattr(Settings.embed_model, "embed_dim", 1536))
 
-def ensure_knowledge_retriever(k:int=6):
-    cfg = _read_cfg()
-    idx_dir = Path(((cfg.get("indexes") or {}).get("dir")) or "api/contextApp/indexstore")
-    store = idx_dir/"knowledge"
-    store.mkdir(parents=True, exist_ok=True)
-    emb = OpenAIEmbeddings(
-        model=(cfg.get("embeddings") or {}).get("openai_model","text-embedding-3-large"),
-        api_key=os.getenv((cfg.get("embeddings") or {}).get("openai_api_key_env","OPENAI_API_KEY"),""),
-        base_url=(cfg.get("embeddings") or {}).get("openai_base_url","https://api.openai.com/v1")
-    )
-    try:
-        vs = FAISS.load_local(store.as_posix(), emb, allow_dangerous_deserialization=True)
-        return vs.as_retriever(search_kwargs={"k":k})
-    except Exception:
-        pass
 
-    # build from /data/knowledge
-    root = Path("src/api/contextApp/data/knowledge")
-    root.mkdir(parents=True, exist_ok=True)
-    files = _load_source_dir(root)
-    if not files:
-        # create a tiny placeholder so queries don't 500
-        open((root/"README.txt"),"w",encoding="utf-8").write("Knowledge base placeholder.")
-        files = [ (root/"README.txt").as_posix() ]
+def ensure_knowledge_index(
+    knowledge_dir: str | Path,
+    persist_dir: str | Path,
+    files: Sequence[str | Path] | None = None,
+) -> Dict[str, Any]:
+    """
+    Build (or reuse) a FAISS-backed index over knowledge files (handbook, agreement, FAQs, etc.)
 
-    docs = []
-    for f in files:
-        docs += TextLoader(f, encoding="utf-8").load()
+    Parameters
+    ----------
+    knowledge_dir : str | Path
+        Directory that contains knowledge files (used if `files` is None).
+    persist_dir : str | Path
+        Where to persist the FAISS + storage artifacts.
+    files : Sequence[str | Path] | None
+        Optional explicit list of files to index. Must be an iterable.
+        Example: [Path("data/knowledge/handbook.md"), Path("data/agreement/Apple-Card.pdf")]
 
-    chunks = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100).split_documents(docs)
-    vs = FAISS.from_documents(chunks, emb)
-    vs.save_local(store.as_posix())
-    return vs.as_retriever(search_kwargs={"k":k})
+    Returns
+    -------
+    Dict[str, Any]
+        Meta about the built index: count, persist_dir, dim.
+    """
+    knowledge_dir = Path(knowledge_dir).resolve()
+    persist_dir = Path(persist_dir).resolve()
+    persist_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Load documents
+    if files:
+        # IMPORTANT: must be an iterable; pass absolute file paths
+        input_files = [str(Path(f).resolve()) for f in files]
+        reader = SimpleDirectoryReader(input_files=input_files)
+    else:
+        reader = SimpleDirectoryReader(input_dir=str(knowledge_dir))
+
+    docs: List[Document] = reader.load_data()
+
+    # ---- Build FAISS store
+    dim = _embed_dim()
+    faiss_index = faiss.IndexFlatIP(dim)  # use cosine-sim via inner product; change to L2 if you prefer
+    vector_store = FaissVectorStore(faiss_index=faiss_index)
+
+    storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(persist_dir))
+
+    # ---- Create index & persist
+    index = VectorStoreIndex.from_documents(docs, storage_context=storage, show_progress=True)
+    storage.persist(persist_dir=str(persist_dir))
+
+    return {"count": len(docs), "persist_dir": str(persist_dir), "dim": dim}

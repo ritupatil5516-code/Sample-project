@@ -1,78 +1,90 @@
 # core/retrieval/json_ingest.py
 from __future__ import annotations
-from typing import List, Dict, Any
+
 from pathlib import Path
-import json, os
+from typing import Dict, Any, List
 
-from langchain_openai import OpenAIEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
+from llama_index.core import Document, VectorStoreIndex, StorageContext, Settings
+from llama_index.vector_stores.faiss import FaissVectorStore
+import faiss
+import json
 
-def _read_cfg():
-    import yaml
-    p = Path("config/app.yaml")
-    return yaml.safe_load(p.read_text(encoding="utf-8")) if p.exists() else {}
 
-def _account_dir(aid:str) -> Path:
-    return Path("src/api/contextApp/data/customer_data")/aid
+def _embed_dim() -> int:
+    return int(getattr(Settings.embed_model, "embed_dim", 1536))
 
-def _to_docs(records: List[Dict[str,Any]], *, source:str, doc_type:str) -> List[Document]:
-    docs: List[Document] = []
-    for i, r in enumerate(records):
-        # flatten into readable text; keep raw in metadata
-        text_parts = []
-        for k,v in r.items():
-            if isinstance(v,(dict,list)): continue
-            text_parts.append(f"{k}: {v}")
-        content = "\n".join(text_parts) or json.dumps(r, ensure_ascii=False)
-        docs.append(Document(page_content=content, metadata={"source":source,"type":doc_type,"raw":r}))
-    return docs
 
-def _split(docs: List[Document]) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
-    return splitter.split_documents(docs)
-
-def _load_json_list(p: Path) -> List[Dict[str,Any]]:
-    if not p.exists(): return []
-    data = json.loads(p.read_text(encoding="utf-8"))
-    return data if isinstance(data,list) else [data]
-
-def build_account_vectorstore(account_id:str, index_dir:Path) -> FAISS:
-    acc = _account_dir(account_id)
-    txns = _load_json_list(acc/"transactions.json")
-    pays = _load_json_list(acc/"payments.json")
-    stmts= _load_json_list(acc/"statements.json")
-    acct = [json.loads((acc/"account_summary.json").read_text(encoding="utf-8"))] if (acc/"account_summary.json").exists() else []
-
-    docs = []
-    docs += _to_docs(txns,  source=f"{account_id}/transactions.json", doc_type="transactions")
-    docs += _to_docs(pays,  source=f"{account_id}/payments.json",     doc_type="payments")
-    docs += _to_docs(stmts, source=f"{account_id}/statements.json",   doc_type="statements")
-    docs += _to_docs(acct,  source=f"{account_id}/account_summary.json", doc_type="account_summary")
-
-    chunks = _split(docs)
-    cfg = _read_cfg()
-    emb = OpenAIEmbeddings(
-        model=(cfg.get("embeddings") or {}).get("openai_model","text-embedding-3-large"),
-        api_key=os.getenv((cfg.get("embeddings") or {}).get("openai_api_key_env","OPENAI_API_KEY"),""),
-        base_url=(cfg.get("embeddings") or {}).get("openai_base_url","https://api.openai.com/v1")
-    )
-    vs = FAISS.from_documents(chunks, emb)
-    (index_dir/f"accounts/{account_id}").mkdir(parents=True, exist_ok=True)
-    vs.save_local((index_dir/f"accounts/{account_id}").as_posix())
-    return vs
-
-def load_account_vectorstore(account_id:str, index_dir:Path) -> FAISS:
-    from langchain_community.vectorstores import FAISS
-    path = index_dir/f"accounts/{account_id}"
-    return FAISS.load_local(path.as_posix(), OpenAIEmbeddings(), allow_dangerous_deserialization=True)
-
-def ensure_account_retriever(account_id:str, k:int=6):
-    cfg = _read_cfg()
-    idx_dir = Path(((cfg.get("indexes") or {}).get("dir")) or "api/contextApp/indexstore")
+def _load_json(path: Path) -> List[Dict[str, Any]]:
+    """
+    Load a JSON file that may be a list or an object.
+    Returns a list of dict rows.
+    """
     try:
-        vs = load_account_vectorstore(account_id, idx_dir)
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        vs = build_account_vectorstore(account_id, idx_dir)
-    return vs.as_retriever(search_kwargs={"k": k})
+        return []
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
+def build_account_index(
+    account_id: str,
+    base_dir: str | Path,          # e.g., data/customer_data/<account_id>
+    persist_dir: str | Path,       # e.g., var/indexes/accounts/<account_id>
+) -> Dict[str, Any]:
+    """
+    Builds a FAISS index for a single account by merging its 4 JSON files
+    (transactions, payments, statements, account_summary) into one vector index.
+
+    The raw JSON row is stored as text; helpful fields are mirrored in metadata
+    for filtering / debugging.
+    """
+    base_dir = Path(base_dir).resolve()
+    persist_dir = Path(persist_dir).resolve()
+    persist_dir.mkdir(parents=True, exist_ok=True)
+
+    files = {
+        "transactions": base_dir / "transactions.json",
+        "payments": base_dir / "payments.json",
+        "statements": base_dir / "statements.json",
+        "account_summary": base_dir / "account_summary.json",
+    }
+
+    docs: List[Document] = []
+    for domain, p in files.items():
+        if not p.exists():
+            continue
+        rows = _load_json(p)
+        for r in rows:
+            # Keep full row as text and add a few useful metadata fields
+            docs.append(
+                Document(
+                    text=json.dumps(r, ensure_ascii=False),
+                    metadata={
+                        "account_id": account_id,
+                        "domain": domain,
+                        # common shortcuts (exist or not depending on file)
+                        "merchantName": r.get("merchantName"),
+                        "transactionType": r.get("transactionType"),
+                        "displayTransactionType": r.get("displayTransactionType"),
+                        "amount": r.get("amount"),
+                        "period": r.get("period"),
+                        "postedDateTime": r.get("postedDateTime"),
+                        "transactionDateTime": r.get("transactionDateTime"),
+                        "closingDateTime": r.get("closingDateTime"),
+                    },
+                )
+            )
+
+    dim = _embed_dim()
+    faiss_index = faiss.IndexFlatIP(dim)
+    vector_store = FaissVectorStore(faiss_index=faiss_index)
+    storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(persist_dir))
+
+    index = VectorStoreIndex.from_documents(docs, storage_context=storage, show_progress=True)
+    storage.persist(persist_dir=str(persist_dir))
+
+    return {"count": len(docs), "persist_dir": str(persist_dir), "dim": dim}
