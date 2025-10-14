@@ -157,16 +157,15 @@ def load_knowledge_index(persist_dir: str | Path) -> VectorStoreIndex:
     storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(p))
     return load_index_from_storage(storage)
 
+def ensure_knowledge_retriever(k: int = 6):
+    """
+    Load the persisted FAISS-backed LlamaIndex for knowledge docs and return
+    a LangChain-compatible retriever wrapper.
+    """
+    base = Path(INDEX_STORE_DIR) / "knowledge" / "llama"
+    vector = FaissVectorStore.from_persist_dir(str(base))
+    storage = StorageContext.from_defaults(vector_store=vector, persist_dir=str(base))
+    index = load_index_from_storage(storage)
 
-# ----------------------------- Public: retriever ------------------------------
-def ensure_knowledge_retriever(k: int = 6, as_langchain: bool = True):
-    """
-    Returns a retriever over the knowledge corpus (handbook.md, policy PDF, etc.).
-    - as_langchain=True (default) returns a LangChain BaseRetriever.
-    - as_langchain=False returns a LlamaIndex retriever.
-    """
-    index = ensure_knowledge_index(force_rebuild=False)
     li_retriever = index.as_retriever(similarity_top_k=k)
-    if not as_langchain:
-        return li_retriever
-    return _LlamaIndexToLangchainRetriever(li_retriever)
+    return _LlamaIndexToLangchainRetriever(li_retriever=li_retriever)

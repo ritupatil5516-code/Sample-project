@@ -1,175 +1,104 @@
-# rag_chain.py
-from __future__ import annotations
-from typing import Any, Dict, List, Iterable
-
-# --- LangChain LLM + memory + CRChain ---
+# --- imports (version-safe) ---
 from langchain_openai import ChatOpenAI
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferWindowMemory
-from langchain.schema import Document as LCDocument
-from langchain.retrievers import BaseRetriever
 
-from core.retrieval.json_ingest import ensure_account_retriever
-from core.retrieval.knowledge_ingest import ensure_knowledge_retriever
+try:
+    # LC >= 0.2
+    from langchain_core.documents import Document as LCDocument
+    from langchain_core.retrievers import BaseRetriever
+    from langchain_core.callbacks import CallbackManagerForRetrieverRun
+except ImportError:  # older LC
+    from langchain.schema import Document as LCDocument
+    try:
+        from langchain.retrievers.base import BaseRetriever
+    except Exception:
+        from langchain.retrievers import BaseRetriever
+    try:
+        from langchain.callbacks.manager import CallbackManagerForRetrieverRun
+    except Exception:
+        CallbackManagerForRetrieverRun = None  # not used in older LC
+
+try:
+    # LC >= 0.2
+    from langchain.retrievers.ensemble import EnsembleRetriever
+except ImportError:
+    # some older builds expose it directly
+    from langchain.retrievers import EnsembleRetriever
+
+from src.api.contextApp.retrieval.json_ingest import ensure_account_retriever
+from src.api.contextApp.retrieval.knowledge_ingest import ensure_knowledge_retriever
 
 
-# -------------------------- LLM factory --------------------------
-
+# --- LLM factory (unchanged) ---
 def _llm_from_cfg():
-    # Keep whatever you had; this mirrors your screenshots
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    # read your cfg/env the same way you already do
+    # keep model/keys as you have them
+    return ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
 
 
-# ----------------- LlamaIndex -> LangChain adapter ----------------
+# --- LlamaIndex -> LangChain retriever shim ---
+class _LlamaIndexToLangchainRetriever(BaseRetriever):
+    """Wrap a LlamaIndex retriever so LC chains can use it."""
 
-class _LlamaIndexToLCRetriever(BaseRetriever):
-    """Wrap a LlamaIndex BaseRetriever so LangChain CRChain can use it."""
-    def __init__(self, li_retriever):
-        super().__init__()
-        self._r = li_retriever
+    li_retriever: object  # pydantic field
 
-    def _nodes_to_lc(self, nodes: Iterable[Any]) -> List[LCDocument]:
-        docs: List[LCDocument] = []
-        for obj in nodes:
-            # LlamaIndex may return NodeWithScore or a Node; normalize
-            node = getattr(obj, "node", obj)
-            # text/content
-            text = getattr(node, "text", None)
-            if not text and hasattr(node, "get_content"):
-                try:
-                    text = node.get_content()
-                except Exception:
-                    text = ""
-            text = text or ""
-            # metadata
-            meta = {}
-            m = getattr(node, "metadata", None)
-            if isinstance(m, dict):
-                meta = dict(m)
-            docs.append(LCDocument(page_content=text, metadata=meta))
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun | None = None
+    ) -> list[LCDocument]:
+        # This is the ONLY place we ever call `.retrieve`:
+        nodes = self.li_retriever.retrieve(query)
+        docs: list[LCDocument] = []
+        for n in nodes:
+            text = getattr(n, "text", None) or (n.get_content() if hasattr(n, "get_content") else "")
+            meta = dict(getattr(n, "metadata", {}) or {})
+            docs.append(LCDocument(page_content=text or "", metadata=meta))
         return docs
 
-    # LangChain sync hook
-    def get_relevant_documents(self, query: str) -> List[LCDocument]:  # type: ignore[override]
-        try:
-            nodes = self._r.retrieve(query)
-        except TypeError:
-            # Some retrievers use .query(...)
-            nodes = self._r.query(query)
-        return self._nodes_to_lc(nodes)
-
-    # LangChain async hook (optional)
-    async def aget_relevant_documents(self, query: str) -> List[LCDocument]:  # type: ignore[override]
-        try:
-            nodes = await self._r.aretrieve(query)  # if available
-        except Exception:
-            nodes = self._r.retrieve(query)
-        return self._nodes_to_lc(nodes)
+    async def _aget_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun | None = None
+    ) -> list[LCDocument]:
+        return self._get_relevant_documents(query, run_manager=run_manager)
 
 
-# ---------------------- memory helper ----------------------------
-
-def _memory(session_id: str, k: int = 10):
-    # Warning about deprecation is harmless; this class still works.
-    # You can migrate later to the new LC memory API if you want.
-    return ConversationBufferWindowMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        k=k,
-        chat_memory_key=session_id,  # keeps sessions separate
+def _crc(llm, retriever: BaseRetriever, session_id: str):
+    mem = ConversationBufferWindowMemory(
+        k=10, return_messages=True, memory_key="chat_history"
     )
-
-
-# ---------------------- chain builder ----------------------------
-
-def _cr_chain(llm, retriever: BaseRetriever, session_id: str):
-    mem = _memory(session_id, k=10)
     return ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,               # <- must be a LangChain BaseRetriever
-        memory=mem,
-        return_source_documents=True,
+        llm=llm, retriever=retriever, memory=mem, return_source_documents=True
     )
 
 
-# ----------------- Public RAG entry points -----------------------
+# ------------------ PUBLIC APIS used by execute.py ------------------
 
-def unified_rag_answer(
-    question: str,
-    session_id: str,
-    account_id: str,
-    k: int = 6,
-    **_ignore,
-) -> Dict[str, Any]:
-    """
-    Hybrid retrieval: account JSONs (LlamaIndex) + knowledge (LlamaIndex),
-    then adapt to LangChain CRChain with an adapter.
-    """
+def unified_rag_answer(question: str, session_id: str, account_id: str, k: int = 6) -> dict:
     llm = _llm_from_cfg()
 
-    # LlamaIndex retrievers (you already build these in your ingest)
+    # >>> THESE return LC *wrappers* around LlamaIndex retrievers
     r_acc = ensure_account_retriever(account_id=account_id, k=k)
     r_kn  = ensure_knowledge_retriever(k=k)
 
-    # Simple weighted blend: get top-k from each and concatenate.
-    # CRChain needs a single retriever; we implement a tiny composite.
-    class _CompositeLCRetriever(BaseRetriever):
-        def __init__(self, r1, r2):
-            super().__init__()
-            self.r1 = _LlamaIndexToLCRetriever(r1)
-            self.r2 = _LlamaIndexToLCRetriever(r2)
-        def get_relevant_documents(self, query: str) -> List[LCDocument]:  # type: ignore[override]
-            a = self.r1.get_relevant_documents(query)
-            b = self.r2.get_relevant_documents(query)
-            # naive blend; keep it simple
-            take = max(1, min(len(a) + len(b), k))
-            return (a + b)[:take]
-        async def aget_relevant_documents(self, query: str) -> List[LCDocument]:  # type: ignore[override]
-            a = await self.r1.aget_relevant_documents(query)
-            b = await self.r2.aget_relevant_documents(query)
-            take = max(1, min(len(a) + len(b), k))
-            return (a + b)[:take]
-
-    lc_retriever = _CompositeLCRetriever(r_acc, r_kn)
-    chain = _cr_chain(llm, lc_retriever, session_id=session_id)
+    retriever = EnsembleRetriever(retrievers=[r_acc, r_kn], weights=[0.7, 0.3])
+    chain = _crc(llm, retriever=retriever, session_id=session_id)
 
     out = chain.invoke({"question": question})
-    src = out.get("source_documents") or []
-    sources = [{"source": d.metadata.get("source") or d.metadata.get("file_path") or "",
-                "snippet": (d.page_content or "")[:180]} for d in src[:4]]
+    srcs = out.get("source_documents") or []
+    sources = [{"source": d.metadata.get("source"), "snippet": (d.page_content or "")[:180]} for d in srcs[:5]]
     return {"answer": out.get("answer") or out.get("result"), "sources": sources}
 
 
-def account_rag_answer(
-    question: str,
-    session_id: str,
-    account_id: str,
-    k: int = 6,
-) -> Dict[str, Any]:
+def account_rag_answer(question: str, session_id: str, account_id: str, k: int = 6) -> dict:
     llm = _llm_from_cfg()
-    r_acc = ensure_account_retriever(account_id=account_id, k=k)  # LlamaIndex retriever
-    lc_ret = _LlamaIndexToLCRetriever(r_acc)                      # adapt
-    chain = _cr_chain(llm, lc_ret, session_id=session_id)
-
+    r_acc = ensure_account_retriever(account_id=account_id, k=k)
+    chain = _crc(llm, retriever=r_acc, session_id=session_id)
     out = chain.invoke({"question": question})
-    src = out.get("source_documents") or []
-    sources = [{"source": d.metadata.get("source") or d.metadata.get("file_path") or "",
-                "snippet": (d.page_content or "")[:180]} for d in src[:4]]
-    return {"answer": out.get("answer") or out.get("result"), "sources": sources}
+    return {"answer": out.get("answer") or out.get("result")}
 
 
-def knowledge_rag_answer(
-    question: str,
-    session_id: str,
-    k: int = 6,
-) -> Dict[str, Any]:
+def knowledge_rag_answer(question: str, session_id: str, k: int = 6) -> dict:
     llm = _llm_from_cfg()
-    r_kn = ensure_knowledge_retriever(k=k)   # LlamaIndex retriever
-    lc_ret = _LlamaIndexToLCRetriever(r_kn)  # adapt
-    chain = _cr_chain(llm, lc_ret, session_id=session_id)
-
+    r_kn = ensure_knowledge_retriever(k=k)
+    chain = _crc(llm, retriever=r_kn, session_id=session_id)
     out = chain.invoke({"question": question})
-    src = out.get("source_documents") or []
-    sources = [{"source": d.metadata.get("source") or d.metadata.get("file_path") or "",
-                "snippet": (d.page_content or "")[:180]} for d in src[:4]]
-    return {"answer": out.get("answer") or out.get("result"), "sources": sources}
+    return {"answer": out.get("answer") or out.get("result")}

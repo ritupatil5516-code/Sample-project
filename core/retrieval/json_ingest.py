@@ -157,18 +157,18 @@ class _LlamaIndexToLangchainRetriever(BaseRetriever):
         return self._get_relevant_documents(query, run_manager=run_manager)
 
 
-def ensure_account_retriever(
-    account_id: str,
-    k: int = 6,
-    as_langchain: bool = True,
-):
+def ensure_account_retriever(account_id: str, k: int = 6):
     """
-    Return a retriever over the account’s JSON (transactions/payments/statements/account_summary).
-    - as_langchain=True (default): LangChain BaseRetriever
-    - as_langchain=False: LlamaIndex retriever
+    Load the persisted FAISS-backed LlamaIndex for this account and return
+    a LangChain-compatible retriever wrapper.
     """
-    index = ensure_account_index(account_id=account_id)
+    base = Path(INDEX_STORE_DIR) / "accounts" / account_id / "llama"
+    vector = FaissVectorStore.from_persist_dir(str(base))
+    storage = StorageContext.from_defaults(vector_store=vector, persist_dir=str(base))
+    index = load_index_from_storage(storage)
+
+    # IMPORTANT: build a LlamaIndex RETRIEVER
     li_retriever = index.as_retriever(similarity_top_k=k)
-    if not as_langchain:
-        return li_retriever
-    return _LlamaIndexToLangchainRetriever(li_retriever)
+
+    # Wrap for LC chains
+    return _LlamaIndexToLangchainRetriever(li_retriever=li_retriever)return _LlamaIndexToLangchainRetriever(li_retriever)
