@@ -665,7 +665,74 @@ def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str,
             ds = _ensure_datasets(account_id) if account_id else _ensure_datasets(None)
 
             if cap == "get_field":
-                res = _op_get_field(dom, args, ds)
+                ds = _ensure_datasets(account_id) if account_id else _ensure_datasets(None)
+
+                rows = ds.get(dom)
+                if rows is None:
+                    results[key] = {"error": f"No data for domain '{dom}'"}
+                    continue
+
+                # support single-object JSON (e.g., account_summary)
+                if isinstance(rows, dict):
+                    rows_list = [rows]
+                elif isinstance(rows, list):
+                    rows_list = rows
+                else:
+                    results[key] = {"error": f"Unsupported data type for domain '{dom}'"}
+                    continue
+
+                # optional account filter if accountId exists in the row
+                if account_id:
+                    filtered = [r for r in rows_list if
+                                str(r.get("accountId") or r.get("account_id")) == str(account_id)]
+                    rows_list = filtered or rows_list
+
+                if not rows_list:
+                    results[key] = {"error": "No matching rows"}
+                    continue
+
+                row = rows_list[0]
+
+                field = (args.get("field") or "").strip()
+                if not field:
+                    results[key] = {"error": "field is required"}
+                    continue
+
+                # alias resolution
+                field_map = FIELD_ALIASES.get(dom, {})
+                key_name = field_map.get(field, field)
+
+                # dotted-path getter (supports indices like persons[0].ownershipType)
+                def _get_path(d: dict, path: str):
+                    cur = d
+                    for part in path.replace("[", ".").replace("]", "").split("."):
+                        if not part:
+                            continue
+                        if isinstance(cur, list):
+                            try:
+                                cur = cur[int(part)]
+                            except Exception:
+                                return None
+                        elif isinstance(cur, dict):
+                            cur = cur.get(part)
+                        else:
+                            return None
+                    return cur
+
+                value = _get_path(row, key_name)
+                if value is None and key_name in row:  # fallback if not dotted
+                    value = row[key_name]
+
+                if value is None and field != key_name and field in row:
+                    # final safety: if alias didn't hit but the raw field exists
+                    value = row[field]
+
+                if value is None:
+                    results[key] = {"value": None, "row": row, "field": field, "resolved_key": key_name,
+                                    "error": f"Field '{field}' not found"}
+                else:
+                    results[key] = {"value": value, "row": row, "field": field, "resolved_key": key_name}
+                continue
             elif cap == "find_latest":
                 res = _op_find_latest(dom, args, ds)  # implement similar helpers as needed
             elif cap == "sum_where":

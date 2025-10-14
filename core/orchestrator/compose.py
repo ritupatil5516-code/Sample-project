@@ -259,6 +259,16 @@ def compose_answer(question: str, plan: Dict[str, Any], results: Dict[str, Any])
             op = "value"
 
         if op == "get_field":
+            val = payload.get("value")
+            if val is None and isinstance(payload.get("row"), dict):
+                fld = payload.get("field")
+                r = payload["row"]
+                # light fallback: try resolved_key, then raw field
+                rk = payload.get("resolved_key")
+                if rk and rk in r:
+                    val = r.get(rk)
+                elif fld and fld in r:
+                    val = r.get(fld)
             lines.append(_render_get_field_payload(payload if isinstance(payload, dict) else {}))
         elif op == "find_latest":
             lines.append(_render_find_latest(payload if isinstance(payload, dict) else {}))
