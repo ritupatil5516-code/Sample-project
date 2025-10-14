@@ -71,6 +71,69 @@ def _normalize_calls(calls: Any) -> List[Dict[str, Any]]:
     return out
 
 # ----------------- helpers -----------------
+
+from typing import Any, Dict, List, Tuple, Optional
+from datetime import datetime, timezone
+
+_TS_KEYS = (
+    "postedDateTime", "transactionDateTime", "paymentPostedDateTime",
+    "paymentDateTime", "closingDateTime", "openingDateTime", "date",
+)
+
+def _pick_latest_row(rows: List[dict]) -> Optional[dict]:
+    def _ts(row: dict) -> Optional[datetime]:
+        for k in _TS_KEYS:
+            v = row.get(k)
+            if isinstance(v, str) and v:
+                try:
+                    return datetime.fromisoformat(v.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+        return None
+    best = None
+    best_ts = None
+    for r in rows:
+        t = _ts(r)
+        if t is not None and (best_ts is None or t > best_ts):
+            best, best_ts = r, t
+    return best or (rows[-1] if rows else None)
+
+def _get_by_path(obj: Any, path: str) -> Any:
+    """Dot-path extractor, e.g. 'accountStatus' or 'person.0.personName'."""
+    if path is None or path == "":
+        return obj
+    cur: Any = obj
+    for token in path.split("."):
+        if cur is None:
+            return None
+        if isinstance(cur, list):
+            try:
+                cur = cur[int(token)]
+                continue
+            except Exception:
+                return None
+        if isinstance(cur, dict):
+            cur = cur.get(token)
+            continue
+        # cannot go deeper
+        return None
+    return cur
+
+def _apply_where(rows: List[dict], where: Dict[str, Any]) -> List[dict]:
+    """Very small filter: all conditions must match; supports dot-path keys."""
+    if not where:
+        return rows
+    out = []
+    for r in rows:
+        ok = True
+        for k, v in where.items():
+            if _get_by_path(r, k) != v:
+                ok = False
+                break
+        if ok:
+            out.append(r)
+    return out
+
 def _within_period(txn: Dict[str, Any], period: str | None) -> bool:
     if not period:
         return True
@@ -140,40 +203,43 @@ def _build_embedder_from_cfg(cfg: Dict[str, Any]) -> Embedder:
     return Embedder(provider=provider, model=model, api_key=api_key, api_base=api_base)
 
 # --------------- generic 5-op DSL executors -----------------------------------
-def _op_get_field(domain: str, args: Dict[str, Any], datasets: Dict[str, Any]) -> Dict[str, Any]:
+def _op_get_field(dom: str, args: Dict[str, Any], ds: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Works across ANY domain.
-    Args:
-      field: path or leaf key
-      where: optional dict of equality filters (applied when dataset is a list)
-      latest: bool – pick the newest row by timestamp fields
+    get_field for any domain. Arguments:
+      - field: dot-path inside the chosen row (required)
+      - where: {path: value} exact filters (optional)
+      - latest: bool (optional, default False) → if True and domain has many rows,
+                choose the latest by timestamp; else choose the first row.
     """
     field = (args.get("field") or "").strip()
-    latest = bool(args.get("latest"))
-    where  = args.get("where") or {}
+    if not field:
+        return {"error": "get_field requires 'field' path"}
 
-    data = datasets.get(domain)
-    if data is None:
-        return {"error": f"Unknown domain {domain}"}
+    latest = bool(args.get("latest", False))
+    where  = dict(args.get("where") or {})
 
-    if isinstance(data, dict):  # account_summary style
-        return {"value": _get_field_from_row(data, field)}
+    # pick domain rows
+    if dom == "transactions":
+        rows = list(ds.get("transactions") or [])
+    elif dom == "payments":
+        rows = list(ds.get("payments") or [])
+    elif dom == "statements":
+        rows = list(ds.get("statements") or [])
+    elif dom == "account_summary":
+        # account_summary could be a single dict or list
+        val = ds.get("account_summary")
+        rows = val if isinstance(val, list) else ([val] if isinstance(val, dict) else [])
+    else:
+        return {"error": f"Unknown domain for get_field: {dom}"}
 
-    rows: List[Dict[str, Any]] = data or []
-    cand = []
-    for r in rows:
-        ok = True
-        for k, v in where.items():
-            if (r.get(k) != v):
-                ok = False; break
-        if ok:
-            cand.append(r)
-    if not cand:
-        cand = rows
-    if not cand:
-        return {"value": None}
-    row = max(cand, key=_latest_key) if latest else cand[0]
-    return {"value": _get_field_from_row(row, field), "row": row}
+    rows = _apply_where(rows, where)
+
+    if not rows:
+        return {"error": "No matching rows"}
+
+    row = _pick_latest_row(rows) if latest else rows[0]
+    value = _get_by_path(row, field)
+    return {"value": value, "row": row}
 
 def _op_find_latest(domain: str, args: Dict[str, Any], datasets: Dict[str, Any]) -> Dict[str, Any]:
     data = datasets.get(domain)
@@ -297,172 +363,75 @@ def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str,
         key  = f"{dom}.{cap}[{i}]"
 
         # pick account_id when relevant
-        account_id = args.get("account_id") or (cfg or {}).get("account_id")  # optional
+        account_id = args.get("account_id") or (cfg or {}).get("account_id")
 
-        # --------- RAG lane ---------------------------------------------------
+        # ---------- RAG lane ONLY when domain_id == "rag" ----------
         if dom == "rag":
-            session_id = (config_paths or {}).get("session_id") or "default"
-            question = (args.get("query") or args.get("q") or (config_paths or {}).get("question") or "").strip()
             k = int(args.get("k", 6))
-            account_id = args.get("account_id") or (config_paths or {}).get("account_id")
-
             try:
-                if cap in ("unified_answer", "unified"):
+                if cap in {"unified_answer", "unified"}:
                     if not account_id:
                         res = {"error": "account_id is required for rag.unified_answer"}
                     else:
-                        res = unified_rag_answer(question=question, session_id=session_id, account_id=account_id, k=k)
-
-                elif cap in ("account_answer", "account_only"):
+                        res = unified_rag_answer(
+                            question=question,
+                            session_id=session_id,
+                            account_id=account_id,
+                            k=k,
+                        )
+                elif cap in {"account_answer", "account_only"}:
                     if not account_id:
                         res = {"error": "account_id is required for rag.account_answer"}
                     else:
-                        res = account_rag_answer(question=question, session_id=session_id, account_id=account_id, k=k)
-
-                elif cap in ("knowledge_answer", "policy_answer", "handbook_answer"):
-                    res = knowledge_rag_answer(question=question, session_id=session_id, k=k)
-
+                        res = account_rag_answer(
+                            question=question,
+                            session_id=session_id,
+                            account_id=account_id,
+                            k=k,
+                        )
+                elif cap in {"knowledge_answer", "policy_answer", "handbook_answer"}:
+                    res = knowledge_rag_answer(
+                        question=question,
+                        session_id=session_id,
+                        k=k,
+                    )
                 else:
-                    res = {"error": f"Unknown rag capability '{cap}'"}
-
+                    res = {"error": f"Unknown rag capability: {cap}"}
             except FileNotFoundError as e:
-                # typically: index missing because startup build wasn’t run or wrong path
                 res = {"error": f"Index not found: {e}"}
             except Exception as e:
                 res = {"error": f"RAG execution error: {e}"}
 
-        # --------- Generic 5-op DSL (works for any domain) --------------------
+            results[key] = res
+            continue  # do not fall through
+
+        # ---------- Generic DSL lane (NO legacy, NO RAG fallback) ----------
         if cap in {"get_field", "find_latest", "sum_where", "topk_by_sum", "list_where", "semantic_search"}:
+            ds = _ensure_datasets(account_id)  # your existing loader bundle
             try:
-                ds = _ensure_datasets(account_id) if account_id else {
-                    "transactions": [], "payments": [], "statements": [], "account_summary": {}
-                }
                 if cap == "get_field":
                     res = _op_get_field(dom, args, ds)
                 elif cap == "find_latest":
-                    res = _op_find_latest(dom, args, ds)
+                    # (optional) you can add a tiny generic impl if you need it
+                    res = {"error": "find_latest not implemented"}
                 elif cap == "sum_where":
-                    res = _op_sum_where(dom, args, ds)
+                    res = {"error": "sum_where not implemented"}
                 elif cap == "topk_by_sum":
-                    res = _op_topk_by_sum(dom, args, ds)
+                    res = {"error": "topk_by_sum not implemented"}
                 elif cap == "list_where":
-                    res = _op_list_where(dom, args, ds)
-                else:  # semantic_search
-                    if dom != "transactions":
-                        res = {"error": "semantic_search currently supported for transactions only"}
-                    else:
-                        res = _op_semantic_search_transactions(args, index_dir=index_dir, embedder=embedder)
+                    res = {"error": "list_where not implemented"}
+                elif cap == "semantic_search":
+                    # keep your FAISS semantic search here if you already had it
+                    res = {"error": "semantic_search not implemented"}
+                else:
+                    res = {"error": f"Unknown DSL capability: {cap}"}
             except Exception as e:
-                res = {"error": f"{cap} failed: {e}"}
+                res = {"error": f"DSL execution error: {e}"}
+
             results[key] = res
             continue
 
-        # --------- Legacy deterministic calculators ---------------------------
-        try:
-            if dom == "transactions":
-                ds = _ensure_datasets(account_id)
-                txns = ds["transactions"]
-                if cap == "last_transaction":
-                    cand = [t for t in txns if (not account_id or t.get("accountId") == account_id)]
-                    last = max(cand, key=_latest_key) if cand else None
-                    res = {"item": last, "trace": {"count": len(cand)}}
-                elif cap == "top_merchants":
-                    period = args.get("period")
-                    rows = [t for t in txns if _within_period(t, period)]
-                    rows = [t for t in rows if (t.get("transactionType") == "DEBIT" or (t.get("amount") or 0) > 0)]
-                    agg: Dict[str, float] = {}
-                    for t in rows:
-                        m = (t.get("merchantName") or "UNKNOWN").strip()
-                        agg[m] = agg.get(m, 0.0) + float(t.get("amount") or 0.0)
-                    top = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
-                    res = {"top_merchants": [{"merchant": m, "total": v} for m, v in top],
-                           "trace": {"count": len(rows), "period": period or "ALL"}}
-                elif cap == "spend_in_period":
-                    res = txn_calc.spend_in_period(txns, account_id, args.get("period"))
-                elif cap == "list_over_threshold":
-                    thr = float(args.get("threshold", 0))
-                    res = txn_calc.list_over_threshold(txns, account_id, thr, args.get("period"))
-                elif cap == "average_per_month":
-                    res = txn_calc.average_per_month(txns, account_id, args.get("period"), None, None, False)
-                elif cap == "find_by_merchant":
-                    q = (args.get("merchant_query") or "").strip().lower()
-                    hits = [t for t in txns if q and q in (t.get("merchantName") or "").lower()]
-                    hits.sort(key=_latest_key, reverse=True)
-                    res = {"items": hits, "count": len(hits)}
-                else:
-                    res = {"error": f"Unknown capability {cap}"}
-
-            elif dom == "payments":
-                ds = _ensure_datasets(account_id)
-                pays = ds["payments"]
-                if cap == "last_payment":
-                    res = pay_calc.last_payment(pays, account_id)
-                elif cap == "total_credited_year":
-                    yr = args.get("year")
-                    res = pay_calc.total_credited_year(pays, account_id, int(yr) if yr else None)
-                elif cap == "payments_in_period":
-                    res = pay_calc.payments_in_period(pays, account_id, args.get("period"))
-                else:
-                    res = {"error": f"Unknown capability {cap}"}
-
-            elif dom == "statements":
-                ds = _ensure_datasets(account_id)
-                stmts = ds["statements"]
-                if cap == "total_interest":
-                    prd = args.get("period")
-                    if prd is None:
-                        # pick latest, optionally nonzero
-                        nz = bool(args.get("nonzero"))
-                        cand = [s for s in stmts if (s.get("interestCharged") or 0) > 0] if nz else stmts
-                        if not cand:
-                            res = {"error": "No statements"}
-                        else:
-                            row = max(cand, key=_latest_key)
-                            res = {"interest_total": row.get("interestCharged") or 0.0,
-                                   "trace": {"period": row.get("period")}}
-                    else:
-                        row = next((s for s in stmts if s.get("period") == prd), None)
-                        res = {"interest_total": (row or {}).get("interestCharged") or 0.0,
-                               "trace": {"period": prd}}
-                elif cap == "interest_breakdown":
-                    res = stmt_calc.interest_breakdown(stmts, account_id, args.get("period"))
-                elif cap == "trailing_interest":
-                    res = stmt_calc.trailing_interest(stmts, account_id, args.get("period"))
-                else:
-                    res = {"error": f"Unknown capability {cap}"}
-
-            elif dom == "account_summary":
-                ds = _ensure_datasets(account_id)
-                acct = ds["account_summary"]
-                if cap == "current_balance":
-                    res = acct_calc.current_balance(acct)
-                elif cap == "available_credit":
-                    res = acct_calc.available_credit(acct)
-                elif cap == "get_field":
-                    res = _op_get_field("account_summary", args, ds)
-                else:
-                    res = {"error": f"Unknown capability {cap}"}
-
-            else:
-                # optional: route unknown domains to RAG fallback
-                ds = _ensure_datasets(account_id) if account_id else {
-                    "transactions": [], "payments": [], "statements": [], "account_summary": {}
-                }
-                res = unified_rag_answer(
-                    question=question,
-                    session_id=session_id,
-                    account_id=account_id or "default",
-                    txns=ds["transactions"], pays=ds["payments"],
-                    stmts=ds["statements"],  acct=ds["account_summary"],
-                    knowledge_paths=[
-                        "data/knowledge/handbook.md",
-                        "data/agreement/Apple-Card-Customer-Agreement.pdf",
-                    ],
-                    top_k=5
-                )
-        except Exception as e:
-            res = {"error": f"Execution failed for {dom}.{cap}: {e}"}
-
-        results[key] = res
+        # ---------- Unknown domain/op (explicit) ----------
+        results[key] = {"error": f"Unknown capability {cap} for domain {dom}"}
 
     return results
