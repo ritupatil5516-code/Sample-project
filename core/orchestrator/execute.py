@@ -606,6 +606,44 @@ def _op_semantic_search(
         },
     }
 
+# dotted / bracket path getter that also supports list/tuple parts
+def _get_path(obj, path):
+    """
+    Examples accepted:
+      - "persons[0].ownershipType"
+      - "persons.0.ownershipType"
+      - ["persons", 0, "ownershipType"]
+    """
+    # Normalize to a list of parts
+    if isinstance(path, (list, tuple)):
+        parts = list(path)
+    else:
+        s = str(path)
+        # turn bracket indexing into dotted segments -> persons[0] -> persons.0
+        s = s.replace('[', '.').replace(']', '')
+        parts = [p for p in s.split('.') if p]
+
+    cur = obj
+    for part in parts:
+        # If current node is a list, treat part as an index
+        if isinstance(cur, list):
+            try:
+                idx = part if isinstance(part, int) else int(str(part))
+                cur = cur[idx]
+            except Exception:
+                return None
+        # If current node is a dict, treat part as a key
+        elif isinstance(cur, dict):
+            key = part if isinstance(part, str) else str(part)
+            cur = cur.get(key)
+        else:
+            return None
+
+        if cur is None:
+            return None
+
+    return cur
+
 # ----------------------------- main executor ----------------------------------
 def execute_calls(calls: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
