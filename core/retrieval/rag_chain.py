@@ -1,13 +1,11 @@
-# core/retrieval/rag_chain.py
 from __future__ import annotations
 from typing import Dict, Any, List, Optional
 import os
 
-# ----------------- LangChain imports (robust across versions) -----------------
+# ----------------- LangChain message types (robust) -----------------
 try:
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 except Exception:
-    # Fallback shims if needed
     class AIMessage:
         def __init__(self, content: str): self.content = content
     class HumanMessage:
@@ -19,14 +17,12 @@ except Exception:
 try:
     from langchain_openai import ChatOpenAI
 except Exception:
-    # Older path
     from langchain.chat_models import ChatOpenAI  # type: ignore
 
-# Memory (robust import + fallback)
+# Memory (robust import + fixed fallback)
 try:
     from langchain.memory import ConversationBufferWindowMemory
 except Exception:
-    # Minimal drop-in replacement with the subset of features we use
     class ConversationBufferWindowMemory:  # type: ignore
         def __init__(self, k: int = 10, memory_key: str = "chat_history",
                      return_messages: bool = True, output_key: Optional[str] = None):
@@ -37,13 +33,18 @@ except Exception:
             self._msgs: List[Any] = []
 
             class _ChatMemory:
-                def __init__(self, outer): self.outer = outer
-                def add_user_message(self, text: str): outer._append(("human", text))
-                def add_ai_message(self, text: str):   outer._append(("ai", text))
+                def __init__(self, outer):
+                    self._outer = outer
+                def add_user_message(self, text: str):
+                    self._outer._append(("human", text))
+                def add_ai_message(self, text: str):
+                    self._outer._append(("ai", text))
+
             self.chat_memory = _ChatMemory(self)
 
         def _append(self, item):
             self._msgs.append(item)
+            # keep last 2k messages (≈ last k exchanges)
             self._msgs = self._msgs[-(2 * self.k):]
 
         def load_memory_variables(self, _) -> Dict[str, Any]:
@@ -58,12 +59,12 @@ except Exception:
                     hist.append((role, text))
             return {self.memory_key: hist}
 
-# Your retrievers (must be LangChain-compatible retrievers)
+# Your retrievers (must be LangChain-compatible or adapted)
 from core.retrieval.json_ingest import ensure_account_retriever
 from core.retrieval.knowledge_ingest import ensure_knowledge_retriever
 
-# Per-session memory cache (avoid referencing class in type annotation for safety)
-_MEMORY_BY_SESSION = {}  # type: Dict[str, ConversationBufferWindowMemory]
+# Per-session memory cache
+_MEMORY_BY_SESSION: Dict[str, ConversationBufferWindowMemory] = {}
 
 
 # -------------------------- helpers --------------------------
@@ -78,7 +79,6 @@ def _get_llm(cfg: Dict[str, Any]) -> ChatOpenAI:
     if api_base and not (api_base.startswith("http://") or api_base.startswith("https://")):
         api_base = "https://" + api_base
 
-    # langchain_openai (new) vs older signature
     try:
         return ChatOpenAI(model=model, api_key=api_key, base_url=api_base, temperature=0)
     except TypeError:
@@ -112,10 +112,10 @@ def _format_docs(docs) -> str:
 
 
 def _pull_docs(retriever: Any, question: str) -> List[Any]:
-    """Call retriever in a version-safe way."""
+    """Version-safe retriever call."""
     if retriever is None:
         return []
-    # Prefer .invoke for LCEL retrievers
+    # LCEL retrievers
     try:
         docs = retriever.invoke(question)
         if isinstance(docs, list):
@@ -129,15 +129,15 @@ def _pull_docs(retriever: Any, question: str) -> List[Any]:
             return docs
     except Exception:
         pass
-    # LlamaIndex adapter might expose .retrieve()
+    # Some adapters expose .retrieve()
     try:
         out = retriever.retrieve(question)
-        # Some adapters return objects with .node.text
         docs = []
         for item in out:
             text = getattr(item, "text", None)
             if text is None and hasattr(item, "node"):
-                text = getattr(item.node, "text", None) or getattr(item.node, "get_content", lambda: "")()
+                node = getattr(item, "node")
+                text = getattr(node, "text", None) or (getattr(node, "get_content", lambda: "")() if node else "")
             if text:
                 class _Doc:
                     def __init__(self, page_content, metadata=None):
@@ -158,29 +158,27 @@ def unified_rag_answer(question: str,
                        cfg: Dict[str, Any],
                        k: int = 6) -> Dict[str, Any]:
     """
-    Simpler, version-agnostic conversational RAG:
-      - Fetch docs from account + knowledge retrievers sequentially
-      - Build a minimal chat prompt with memory and context
-      - Call the LLM directly
+    Conversational RAG without LCEL dependencies:
+      - fetch from account + knowledge retrievers sequentially
+      - build a minimal chat prompt with memory and context
+      - call the LLM directly
+
     Returns {"answer": str, "sources": []}
     """
-    # LLM and memory
     llm = _get_llm(cfg)
     mem = _get_memory(session_id, k=10)
 
-    # Prepare chat history (LangChain message objects if available)
+    # history from memory
     chat_history = mem.load_memory_variables({}).get("chat_history") or []
 
-    # Retrievers
+    # retrieve
     acc_ret = ensure_account_retriever(account_id)
     knw_ret = ensure_knowledge_retriever()
-
-    # Retrieve docs (no RunnableParallel)
     acc_docs = _pull_docs(acc_ret, question)
     knw_docs = _pull_docs(knw_ret, question)
     context = _format_docs(acc_docs + knw_docs)
 
-    # Compose prompt
+    # prompt
     sys_a = SystemMessage(
         content=(
             "You are a precise banking copilot. Answer ONLY from the provided context. "
@@ -192,14 +190,14 @@ def unified_rag_answer(question: str,
 
     messages = [sys_a] + chat_history + [user, sys_ctx]
 
-    # Invoke model
+    # invoke
     try:
         resp = llm.invoke(messages)
         text = getattr(resp, "content", str(resp))
     except Exception as e:
         text = f"(RAG error: {type(e).__name__}: {e})"
 
-    # Update memory
+    # update memory
     try:
         mem.chat_memory.add_user_message(question)
         mem.chat_memory.add_ai_message(text)
