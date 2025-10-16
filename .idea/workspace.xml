@@ -5,9 +5,21 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="8995c3af-8f90-402c-86b4-9fc976f7a0d7" name="Changes" comment="changes">
-      <change afterPath="$PROJECT_DIR$/info.md" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/core/domains/account_summary_plugin.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/core/domains/base.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/core/domains/payments_plugin.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/core/domains/rag_plugin.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/core/domains/registry.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/core/domains/statements_plugin.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/core/domains/transactions_plugin.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/core/orchestrator/dsl_ops.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/runtime.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/dsl_ops.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/dsl_ops.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/server/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/server/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/orchestrator/compose.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/compose.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/orchestrator/execute.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/execute.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/orchestrator/plan_llm.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/orchestrator/plan_llm.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/retrieval/rag_chain.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/retrieval/rag_chain.py" afterDir="false" />
     </list>
     <list id="571996ee-ce96-4316-a5ad-ffa6ec27a835" name="local" comment="local">
       <change beforePath="$PROJECT_DIR$/.env" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
@@ -70,6 +82,8 @@
       <recent name="$PROJECT_DIR$/data/agreement" />
     </key>
     <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$" />
+      <recent name="$PROJECT_DIR$/core" />
       <recent name="$PROJECT_DIR$/data/agreement" />
       <recent name="$PROJECT_DIR$/data/knowledge" />
     </key>
@@ -445,7 +459,47 @@
       <option name="project" value="LOCAL" />
       <updated>1760460799546</updated>
     </task>
-    <option name="localTasksCounter" value="39" />
+    <task id="LOCAL-00039" summary="changes">
+      <option name="closed" value="true" />
+      <created>1760461359447</created>
+      <option name="number" value="00039" />
+      <option name="presentableId" value="LOCAL-00039" />
+      <option name="project" value="LOCAL" />
+      <updated>1760461359447</updated>
+    </task>
+    <task id="LOCAL-00040" summary="changes">
+      <option name="closed" value="true" />
+      <created>1760461546033</created>
+      <option name="number" value="00040" />
+      <option name="presentableId" value="LOCAL-00040" />
+      <option name="project" value="LOCAL" />
+      <updated>1760461546033</updated>
+    </task>
+    <task id="LOCAL-00041" summary="changes">
+      <option name="closed" value="true" />
+      <created>1760468741045</created>
+      <option name="number" value="00041" />
+      <option name="presentableId" value="LOCAL-00041" />
+      <option name="project" value="LOCAL" />
+      <updated>1760468741045</updated>
+    </task>
+    <task id="LOCAL-00042" summary="changes">
+      <option name="closed" value="true" />
+      <created>1760477817927</created>
+      <option name="number" value="00042" />
+      <option name="presentableId" value="LOCAL-00042" />
+      <option name="project" value="LOCAL" />
+      <updated>1760477817927</updated>
+    </task>
+    <task id="LOCAL-00043" summary="changes">
+      <option name="closed" value="true" />
+      <created>1760501653924</created>
+      <option name="number" value="00043" />
+      <option name="presentableId" value="LOCAL-00043" />
+      <option name="project" value="LOCAL" />
+      <updated>1760501653924</updated>
+    </task>
+    <option name="localTasksCounter" value="44" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -474,12 +528,7 @@
       <breakpoints>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/core/orchestrator/execute.py</url>
-          <line>234</line>
-          <option name="timeStamp" value="2" />
-        </line-breakpoint>
-        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/core/orchestrator/execute.py</url>
-          <line>180</line>
+          <line>41</line>
           <option name="timeStamp" value="3" />
         </line-breakpoint>
       </breakpoints>
