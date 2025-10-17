@@ -1,196 +1,194 @@
 # core/retrieval/rag_chain.py
 from __future__ import annotations
-import os, json, yaml, httpx
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-# ---- FAISS registry (already in your project) ----
-try:
-    from core.index.faiss_registry import query_index, Embedder
-except Exception as e:
-    raise RuntimeError("Missing core.index.faiss_registry (need query_index, Embedder).") from e
+# LangChain (conversation + ensemble)
+from langchain.chains import ConversationalRetrievalChain
+from langchain.retrievers import EnsembleRetriever
 
-# ---------- tiny in-process memory by session (last 10 turns) ----------
-_MEMORY: Dict[str, List[Tuple[str, str]]] = {}  # session_id -> [(role, text)]
+# LlamaIndex (load persisted FAISS indexes)
+from llama_index.core import StorageContext, load_index_from_storage
+from llama_index.vector_stores.faiss import FaissVectorStore
 
-def _mem_get(session_id: str) -> List[Tuple[str, str]]:
-    return _MEMORY.setdefault(session_id, [])
+# Your process-wide singletons (LLM, memory, cfg)
+from src.core.runtime import RUNTIME
 
-def _mem_add(session_id: str, role: str, text: str, keep: int = 10):
-    hist = _MEMORY.setdefault(session_id, [])
-    hist.append((role, text))
-    # keep last N user/assistant messages
-    if len(hist) > keep * 2:
-        del hist[: len(hist) - keep * 2]
 
-# ---------- config helpers ----------
-def _read_app_cfg(path: str) -> Dict[str, Any]:
-    p = Path(path)
-    if not p.exists(): return {}
+# --------------------------- LlamaIndex helpers ---------------------------
+
+def _li_index_from_dir(persist_dir: str):
+    """Load a LlamaIndex VectorStoreIndex from a FAISS persist_dir. Returns None if missing."""
+    p = Path(persist_dir)
+    if not p.exists():
+        return None
     try:
-        return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return {}
-
-def _build_embedder_from_cfg(cfg: Dict[str, Any]) -> Embedder:
-    emb = (cfg.get("embeddings") or {})
-    provider = (emb.get("provider") or "openai").strip().lower()
-    if provider == "qwen":
-        api_base = (emb.get("qwen_base_url") or emb.get("api_base") or "https://dashscope.aliyuncs.com/compatible-mode/v1").strip()
-        model    = (emb.get("qwen_model") or emb.get("model") or "qwen3-embedding").strip()
-        key_env  = (emb.get("qwen_api_key_env") or "QWEN_API_KEY").strip()
-    else:
-        api_base = (emb.get("openai_base_url") or emb.get("api_base") or "https://api.openai.com/v1").strip()
-        model    = (emb.get("openai_model") or emb.get("model") or "text-embedding-3-large").strip()
-        key_env  = (emb.get("openai_api_key_env") or "OPENAI_API_KEY").strip()
-    api_key = (os.getenv(key_env) or "").strip()
-    return Embedder(provider=provider, model=model, api_key=api_key, api_base=api_base)
-
-# ---------- tiny OpenAI-compatible LLM client (httpx) ----------
-class _LLMClient:
-    def __init__(self, api_base: str, api_key: str, model: str):
-        self.api_base = api_base.rstrip("/")
-        self.api_key = api_key
-        self.model = model
-
-    def invoke(self, messages: List[Dict[str, Any]], model: Optional[str] = None, temperature: float = 0.0) -> str:
-        url = f"{self.api_base}/chat/completions"
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = {"model": model or self.model, "messages": messages, "temperature": float(temperature)}
-        with httpx.Client(timeout=40.0) as client:
-            r = client.post(url, headers=headers, json=payload)
-            if r.status_code >= 400:
-                # print server error for quick diagnosis
-                print("[LLM ERROR]", r.status_code, r.text)
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"]["content"]
-
-def _get_llm(cfg: Dict[str, Any]) -> _LLMClient:
-    llm_cfg = (cfg.get("llm") or {})
-    api_base = (llm_cfg.get("api_base") or llm_cfg.get("base_url") or "https://api.openai.com/v1").strip()
-    if api_base and not api_base.startswith("http"): api_base = "https://" + api_base
-    api_key  = (llm_cfg.get("api_key") or os.getenv(llm_cfg.get("api_key_env", "OPENAI_API_KEY"), "") or llm_cfg.get("key") or "").strip()
-    model    = (llm_cfg.get("model") or "gpt-4o-mini").strip()
-    if not api_key:
-        raise RuntimeError("Missing LLM API key. Set llm.api_key or export env named by llm.api_key_env.")
-    return _LLMClient(api_base=api_base, api_key=api_key, model=model)
-
-# ---------- retrieval helpers using your FAISS indexes ----------
-def _faiss_hits(
-    domain: str,
-    query: str,
-    embedder: Embedder,
-    index_dir: str,
-    top_k: int = 6,
-    account_id: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Returns a normalized list of hits: {"text", "payload", "score"}
-    Filters by account_id if payload.accountId matches in the index payload.
-    """
-    try:
-        hits = query_index(domain=domain, query=query, top_k=int(top_k), index_dir=index_dir, embedder=embedder)
+        vs = FaissVectorStore.from_persist_dir(str(p))
+        sc = StorageContext.from_defaults(vector_store=vs, persist_dir=str(p))
+        return load_index_from_storage(sc)
     except Exception as e:
-        print(f"[RAG] query_index failed for {domain}: {e}")
-        return []
-    out = []
-    for h in hits or []:
-        payload = h.get("payload") or {}
-        if account_id and payload.get("accountId") not in (account_id, str(account_id)):
-            # keep only matching account if available
-            continue
-        out.append({"text": h.get("text") or "", "payload": payload, "score": float(h.get("score", 0.0))})
-    return out
+        print(f"[RAG] load_index_from_storage failed @ {persist_dir}: {e}")
+        return None
 
-def _format_docs(docs: List[Dict[str, Any]], max_len: int = 1600) -> str:
-    """
-    Builds a compact context block that keeps within a rough token budget.
-    One line per doc: [source] snippet
-    """
-    lines: List[str] = []
-    total = 0
-    for d in docs:
-        p = d.get("payload") or {}
-        src = p.get("source") or p.get("path") or p.get("file") or p.get("domain") or "doc"
-        snippet = (d.get("text") or "").strip().replace("\n", " ")
-        if not snippet: continue
-        line = f"[{src}] {snippet}"
-        if total + len(line) > max_len:
-            break
-        lines.append(line); total += len(line)
-    return "\n".join(lines)
 
-def _collect_sources(docs: List[Dict[str, Any]], limit: int = 8) -> List[Dict[str, str]]:
-    out = []
-    for d in docs[:limit]:
-        p = d.get("payload") or {}
-        out.append({
-            "source": p.get("source") or p.get("path") or p.get("file") or p.get("domain") or "",
-            "snippet": (d.get("text") or "")[:200]
-        })
-    return out
+def _lc_retriever_from_dir(persist_dir: str, k: int = 6):
+    """Return a LangChain retriever adapted from a LlamaIndex retriever, or None."""
+    index = _li_index_from_dir(persist_dir)
+    if index is None:
+        return None
+    li_ret = index.as_retriever(similarity_top_k=int(k))
+    try:
+        return li_ret.as_langchain()  # <-- critical adapter for LC chains
+    except Exception as e:
+        print(f"[RAG] as_langchain() failed @ {persist_dir}: {e}")
+        return None
 
-# ---------- public API ----------
+
+# --------------------------- Public entry points ---------------------------
+
 def unified_rag_answer(
     question: str,
     session_id: str,
     account_id: Optional[str],
-    cfg: Dict[str, Any],
     k: int = 6,
 ) -> Dict[str, Any]:
     """
-    Single entry point used by execute.py when strategy=='rag' (or fallback).
-    - Retrieves from account JSON indexes (transactions/payments/statements)
-      and from knowledge index (handbook, policy/agreement).
-    - Uses in-memory chat history (last ~10 user/assistant turns).
-    - Calls your OpenAI-compatible LLM with the assembled context.
-    Returns: {"answer": str, "sources": [{source, snippet}, ...]}
+    Conversational RAG using:
+      - account index: var/indexes/accounts/{account_id}
+      - knowledge index: var/indexes/knowledge
+    LLM + memory come from RUNTIME. LlamaIndex retrievers are adapted to LC.
     """
-    try:
-        llm = _get_llm(cfg)
-        embedder = _build_embedder_from_cfg(cfg)
-        idx_dir = ((cfg.get("indexes") or {}).get("dir")) or "var/indexes"
+    cfg = RUNTIME.cfg or {}
+    chat = RUNTIME.chat()                 # shared ChatOpenAI (or OpenAI-compatible) from runtime
+    memory = RUNTIME.memory(session_id)   # ConversationBufferWindowMemory from runtime
 
-        # ---- 1) Retrieval (FAISS) ----
-        # Account JSON domains
-        acc_docs = []
-        for dom in ("transactions", "payments", "statements"):
-            acc_docs += _faiss_hits(domain=dom, query=question, embedder=embedder, index_dir=idx_dir, top_k=k, account_id=account_id)
+    idx_dir = ((cfg.get("indexes") or {}).get("dir")) or "var/indexes"
+    acc_dir = (Path(idx_dir) / "accounts" / str(account_id)) if account_id else None
+    kn_dir  = Path(idx_dir) / "knowledge"
 
-        # Knowledge (handbook + agreement) – assume you built a 'knowledge' index
-        kn_docs = _faiss_hits(domain="knowledge", query=question, embedder=embedder, index_dir=idx_dir, top_k=k, account_id=None)
+    retrievers: List = []
+    # account retriever (if available)
+    if acc_dir:
+        r_acc = _lc_retriever_from_dir(acc_dir.as_posix(), k=k)
+        if r_acc:
+            retrievers.append(("acc", r_acc))
+        else:
+            print(f"[RAG] missing account retriever @ {acc_dir}")
 
-        docs = sorted(acc_docs + kn_docs, key=lambda d: d.get("score", 0.0), reverse=True)[: max(3, k)]
-        context_block = _format_docs(docs)
-        sources = _collect_sources(docs)
+    # knowledge retriever (handbook + agreement)
+    r_kn = _lc_retriever_from_dir(kn_dir.as_posix(), k=k)
+    if r_kn:
+        retrievers.append(("kn", r_kn))
+    else:
+        print(f"[RAG] missing knowledge retriever @ {kn_dir}")
 
-        # ---- 2) Build messages with short-term memory ----
-        hist = _mem_get(session_id)
-        msg_hist: List[Dict[str, str]] = []
-        for role, text in hist[-20:]:
-            if not text: continue
-            if role in ("human", "user"):
-                msg_hist.append({"role": "user", "content": text})
-            else:
-                msg_hist.append({"role": "assistant", "content": text})
+    if not retrievers:
+        return {
+            "answer": "I don’t have any indexed data available yet to answer this.",
+            "sources": [],
+            "error": "no_retriever",
+        }
 
-        sys = {"role": "system", "content":
-               "You are a precise banking copilot. Answer ONLY using the provided context. "
-               "If the context is insufficient, say \"I don't know\". Be concise and factual."}
-        ctx = {"role": "system", "content": f"Context:\n{context_block}"} if context_block else {"role":"system","content":"Context: (no supporting passages found)"}
-        user = {"role": "user", "content": question}
+    # combine (if both present) or use the single one
+    if len(retrievers) == 1:
+        retriever = retrievers[0][1]
+    else:
+        # prefer account evidence a bit more than generic knowledge
+        retriever = EnsembleRetriever(
+            retrievers=[r for _, r in retrievers],
+            weights=[0.7, 0.3] if len(retrievers) == 2 else None,
+        )
 
-        messages = [sys] + msg_hist + [ctx, user]
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=chat,
+        retriever=retriever,
+        memory=memory,
+        return_source_documents=True,
+    )
 
-        # ---- 3) LLM call ----
-        answer = llm.invoke(messages, model=(cfg.get("llm") or {}).get("model"), temperature=0)
+    out = chain.invoke({"question": question})
+    docs = out.get("source_documents") or []
+    sources = []
+    for d in docs[:6]:
+        try:
+            md = getattr(d, "metadata", {}) or {}
+            sources.append({
+                "source": md.get("source") or md.get("file_path") or md.get("path") or "doc",
+                "snippet": (d.page_content or "")[:220],
+            })
+        except Exception:
+            pass
 
-        # ---- 4) Update memory ----
-        _mem_add(session_id, "human", question)
-        _mem_add(session_id, "ai", answer)
+    answer = out.get("answer") or out.get("result") or ""
+    return {"answer": answer, "sources": sources}
 
-        return {"answer": answer, "sources": sources}
 
-    except Exception as e:
-        return {"answer": "I hit an error running RAG.", "sources": [], "error": f"{type(e).__name__}: {e}"}
+def account_rag_answer(
+    question: str,
+    session_id: str,
+    account_id: str,
+    k: int = 6,
+) -> Dict[str, Any]:
+    """RAG limited to a single account index."""
+    cfg = RUNTIME.cfg or {}
+    chat = RUNTIME.chat()
+    memory = RUNTIME.memory(session_id)
+    idx_dir = ((cfg.get("indexes") or {}).get("dir")) or "var/indexes"
+    acc_dir = Path(idx_dir) / "accounts" / str(account_id)
+
+    r_acc = _lc_retriever_from_dir(acc_dir.as_posix(), k=k)
+    if not r_acc:
+        return {"answer": "I don’t see an index for this account yet.", "sources": [], "error": "no_account_index"}
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=chat, retriever=r_acc, memory=memory, return_source_documents=True
+    )
+    out = chain.invoke({"question": question})
+    docs = out.get("source_documents") or []
+    sources = []
+    for d in docs[:6]:
+        try:
+            md = getattr(d, "metadata", {}) or {}
+            sources.append({
+                "source": md.get("source") or md.get("file_path") or md.get("path") or "doc",
+                "snippet": (d.page_content or "")[:220],
+            })
+        except Exception:
+            pass
+
+    return {"answer": out.get("answer") or out.get("result") or "", "sources": sources}
+
+
+def knowledge_rag_answer(
+    question: str,
+    session_id: str,
+    k: int = 6,
+) -> Dict[str, Any]:
+    """RAG limited to the knowledge index (handbook + policy/agreement)."""
+    cfg = RUNTIME.cfg or {}
+    chat = RUNTIME.chat()
+    memory = RUNTIME.memory(session_id)
+    idx_dir = ((cfg.get("indexes") or {}).get("dir")) or "var/indexes"
+    kn_dir = Path(idx_dir) / "knowledge"
+
+    r_kn = _lc_retriever_from_dir(kn_dir.as_posix(), k=k)
+    if not r_kn:
+        return {"answer": "Knowledge index not found yet.", "sources": [], "error": "no_knowledge_index"}
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=chat, retriever=r_kn, memory=memory, return_source_documents=True
+    )
+    out = chain.invoke({"question": question})
+    docs = out.get("source_documents") or []
+    sources = []
+    for d in docs[:6]:
+        try:
+            md = getattr(d, "metadata", {}) or {}
+            sources.append({
+                "source": md.get("source") or md.get("file_path") or md.get("path") or "doc",
+                "snippet": (d.page_content or "")[:220],
+            })
+        except Exception:
+            pass
+
+    return {"answer": out.get("answer") or out.get("result") or "", "sources": sources}

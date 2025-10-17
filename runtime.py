@@ -1,37 +1,64 @@
-# src/api/contextApp/runtime.py
+# src/core/runtime.py
 from __future__ import annotations
-from typing import Dict, Optional
+from typing import Optional
+import httpx
+from pydantic import BaseModel
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.memory import ConversationBufferWindowMemory
+from src.api.contextApp.memory.memory_store import MEMORY as _MEMORY
 
-class _Runtime:
-    llm: Optional[ChatOpenAI] = None
-    embeddings: Optional[OpenAIEmbeddings] = None
-    memories: Dict[str, ConversationBufferWindowMemory] = {}
-    history_k: int = 10
+class RuntimeConfig(BaseModel):
+    llm_model: str = "gpt-4o-mini"
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_api_key: str = ""
+    embed_model: str = "text-embedding-3-large"
+    embed_base_url: str = "https://api.openai.com/v1"
+    embed_api_key: str = ""
+    memory_window_k: int = 10
 
-RUNTIME = _Runtime()
+class AppRuntime:
+    def __init__(self) -> None:
+        self.cfg: Optional[RuntimeConfig] = None
+        self._http: Optional[httpx.AsyncClient] = None
+        self._chat: Optional[ChatOpenAI] = None
+        self._emb: Optional[OpenAIEmbeddings] = None
 
-def init_llm(*, model: str, api_key: str, api_base: Optional[str] = None, temperature: float = 0.0):
-    RUNTIME.llm = ChatOpenAI(model=model, api_key=api_key, base_url=api_base, temperature=temperature)
+    async def startup(self, cfg: RuntimeConfig, http_client: Optional[httpx.AsyncClient] = None):
+        self.cfg = cfg
+        self._http = http_client or httpx.AsyncClient(timeout=30)
+        # one shared chat model
+        self._chat = ChatOpenAI(
+            model=cfg.llm_model,
+            temperature=0,
+            base_url=cfg.llm_base_url,
+            api_key=cfg.llm_api_key,
+        )
+        # one shared embedding model
+        self._emb = OpenAIEmbeddings(
+            model=cfg.embed_model,
+            base_url=cfg.embed_base_url,
+            api_key=cfg.embed_api_key,
+        )
+        # configure memory window; memory objects are created lazily per session
+        _MEMORY.configure(window_k=cfg.memory_window_k)
 
-def init_embeddings(*, model: str, api_key: str, api_base: Optional[str] = None):
-    RUNTIME.embeddings = OpenAIEmbeddings(model=model, api_key=api_key, base_url=api_base)
+    async def shutdown(self):
+        if self._http:
+            await self._http.aclose()
 
-def set_memory_window(k: int = 10):
-    RUNTIME.history_k = max(1, int(k))
+    # --- getters used across the app ---
+    def chat(self) -> ChatOpenAI:
+        assert self._chat is not None, "Runtime not started"
+        return self._chat
 
-def get_llm() -> ChatOpenAI:
-    assert RUNTIME.llm, "LLM not initialized"
-    return RUNTIME.llm
+    def embeddings(self) -> OpenAIEmbeddings:
+        assert self._emb is not None, "Runtime not started"
+        return self._emb
 
-def get_embeddings() -> OpenAIEmbeddings:
-    assert RUNTIME.embeddings, "Embeddings not initialized"
-    return RUNTIME.embeddings
+    def memory(self, session_id: str):
+        return _MEMORY.get(session_id)
 
-def get_memory(session_id: str) -> ConversationBufferWindowMemory:
-    mem = RUNTIME.memories.get(session_id)
-    if not mem:
-        mem = ConversationBufferWindowMemory(k=RUNTIME.history_k, return_messages=True, memory_key="chat_history")
-        RUNTIME.memories[session_id] = mem
-    return mem
+# module-level singleton and DI helper
+RUNTIME = AppRuntime()
+
+def get_runtime() -> AppRuntime:
+    return RUNTIME
