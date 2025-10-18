@@ -13,7 +13,7 @@ from core.context.builder import build_context
 from core.context.hints import build_hint_for_question
 
 # Runtime LLM (set in FastAPI startup)
-from src.core.runtime import RUNTIME  # expose .chat() LangChain ChatOpenAI (or equivalent)
+from src.core.runtime import RUNTIME  # exposes .chat() (LangChain ChatOpenAI or equivalent)
 
 # -----------------------------------------------------------------------------#
 # Limits & aliases
@@ -111,7 +111,7 @@ def _infer_dates(question: str) -> Dict[str, str]:
     m = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", q)
     if m:
         out["YYYY-MM"] = f"{m.group(1)}-{m.group(2)}"
-    mq = re.search(r"(20\d{2})\s*[- ]?q([1-4])", q)
+    mq = re.search(r"(20\d{2})\s*[- ]?q([1-4])", q, re.I)
     if mq:
         out["YYYY-Q*"] = f"{mq.group(1)}-Q{mq.group(2)}"
     return out
@@ -155,7 +155,6 @@ def _choose_strategy(question: str, explicit: Optional[str]) -> str:
         return explicit
     toks = set(_tokens(question))
     if (toks & EXPLAIN_WORDS) or (toks & POLICY_WORDS):
-        # default to unified so we can blend account JSON + policy
         return "rag:unified"
     return "deterministic"
 
@@ -267,8 +266,10 @@ def _build_llm_messages(ctx: Dict[str, Any], pack: Dict[str, Any], question: str
 def _coerce_text(resp: Any) -> str:
     if resp is None:
         return ""
+    # LangChain AIMessage path
     if hasattr(resp, "content") and isinstance(getattr(resp, "content"), str):
         return resp.content
+    # OpenAI raw dict-ish path
     if isinstance(resp, dict):
         try:
             return resp["choices"][0]["message"]["content"]
@@ -338,10 +339,7 @@ def llm_plan(question: str) -> Dict[str, Any]:
     messages = _build_llm_messages(ctx, pack, question, hint)
 
     llm = RUNTIME.chat()
-    try:
-        resp = llm.invoke(messages)  # LangChain ChatOpenAI path
-    except AttributeError:
-        resp = getattr(llm, "complete")(messages, temperature=0)  # custom client path
+    resp = llm.invoke(messages)  # LangChain ChatOpenAI style
 
     text = _coerce_text(resp)
     js = _extract_json(text)

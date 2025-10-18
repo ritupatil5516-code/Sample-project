@@ -244,7 +244,11 @@ def compose_answer(
         domain, op = _domain_from_key(key)
         p = payload if isinstance(payload, dict) else {}
 
-        # Human text
+        if domain == "rag" or op in ("unified_answer", "account_answer", "handbook_answer", "knowledge_answer"):
+            lines.append(_render_rag(payload if isinstance(payload, dict) else {}))
+            continue
+
+        # Human text + struct
         if op == "get_field":
             txt = _render_get_field(p.get("value"))
             items.append(_struct_for_get_field(domain, p))
@@ -279,7 +283,6 @@ def compose_answer(
                 txt = "\n".join(view)
             items.append(_struct_for_semantic_search(domain, p))
         else:
-            # Legacy fallback
             rend = _render_legacy_value(p)
             txt = rend if rend is not None else _shorten(json.dumps(p, ensure_ascii=False))
 
@@ -299,3 +302,16 @@ def compose_answer(
             "items": items
         }
     return answer_text
+
+
+def _render_rag(payload: Dict[str, Any]) -> str:
+    txt = (payload or {}).get("answer") or "I couldn't find anything relevant."
+    srcs = (payload or {}).get("sources") or []
+    if not srcs:
+        return txt
+    lines = [txt, "", "Sources:"]
+    for s in srcs[:5]:
+        src = s.get("source") or "source"
+        snip = _shorten(s.get("snippet") or "", 160)
+        lines.append(f"- {src}: {snip}")
+    return "\n".join(lines)
