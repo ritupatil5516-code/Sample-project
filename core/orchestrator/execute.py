@@ -2,24 +2,14 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
 import threading
+import re
 
-# Single source of truth for domain metadata + loaders
 from domains.registry import normalize_domain, get_plugin, load_domain
-
-# Deterministic, domain-agnostic operators
 from dsl_ops import OPS as DSL_OPS
-
-# Shared runtime (LLM, cfg). Must be initialized at app startup.
 from src.core.runtime import RUNTIME
-
-# RAG lane (unified account + knowledge)
 from core.retrieval.rag_chain import unified_rag_answer
 
-
-# --------------------------------------------------------------------------------------
-# Per-session scratch to enable follow-ups like:
-# “Where did I spend most?” -> “Give dates for each spend”
-# --------------------------------------------------------------------------------------
+# --------------------------- per-session scratch (follow-ups) ---------------------------
 _SCRATCH_LOCK = threading.Lock()
 _SCRATCH: Dict[str, Dict[str, Any]] = {}
 
@@ -28,37 +18,74 @@ def _get_scratch(session_id: str) -> Dict[str, Any]:
     with _SCRATCH_LOCK:
         return _SCRATCH.setdefault(sid, {})
 
-
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
+# --------------------------- small helpers ---------------------------
 def _normalize_cap(name: str) -> str:
     return (name or "").strip().lower().replace("-", "_")
 
 def _is_empty_result(res: Optional[Dict[str, Any]]) -> bool:
-    if not res or not isinstance(res, dict):
-        return True
-    if "error" in res:
-        return True
-    if res.get("value") in (None, "", []):
-        return True
-    if res.get("items") == []:
-        return True
-    if res.get("top") == []:
-        return True
+    if not res or not isinstance(res, dict): return True
+    if "error" in res: return True
+    if res.get("value") in (None, "", []): return True
+    if res.get("items") == []: return True
+    if res.get("top") == []: return True
     if "total" in res and "count" in res:
         try:
-            cnt = int(res.get("count", 0))
+            if int(res.get("count", 0)) == 0:
+                return True
         except Exception:
-            cnt = 0
-        if cnt == 0:
             return True
     return False
 
+# ---- parse "field>0" / "field>=123.45" into where dict ----
+_FILTER_RE = re.compile(r"^\s*(?P<f>\w+)\s*(?P<op>>=|<=|>|<|=)\s*(?P<v>-?\d+(?:\.\d+)?)\s*$")
 
-# --------------------------------------------------------------------------------------
-# Main entry
-# --------------------------------------------------------------------------------------
+def _parse_filter(expr: str) -> Optional[Dict[str, Any]]:
+    if not expr:
+        return None
+    m = _FILTER_RE.match(str(expr))
+    if not m:
+        return None
+    f = m.group("f")
+    op = m.group("op")
+    v  = float(m.group("v"))
+    return {f: {op: v}}
+
+def _normalize_args(dom: str, cap: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Make planner args uniform for DSL ops:
+      - accept legacy 'filter: "field>0"' and convert to where dict
+      - coerce common numeric params
+      - provide safer defaults (e.g., field for find_latest if missing)
+    """
+    out = dict(args or {})
+
+    # filter → where
+    if "filter" in out and "where" not in out:
+        parsed = _parse_filter(out.get("filter"))
+        if parsed:
+            out["where"] = parsed
+        out.pop("filter", None)
+
+    # ints
+    for k in ("k", "limit", "offset", "top_k"):
+        if k in out:
+            try:
+                out[k] = int(out[k])
+            except Exception:
+                out[k] = out[k]
+
+    # default field for find_latest by domain
+    if cap == "find_latest" and not out.get("field"):
+        out["field"] = {
+            "transactions": "postedDateTime",
+            "payments":     "paymentPostedDateTime",
+            "statements":   "closingDateTime",
+            "accounts":     "date",
+        }.get(dom, "date")
+
+    return out
+
+# --------------------------- main executor ---------------------------
 def execute_calls(calls: List[Dict[str, Any]], context: Dict[str, Any]) -> Dict[str, Any]:
     """
     Executes planner calls with strategy-aware routing:
@@ -82,9 +109,10 @@ def execute_calls(calls: List[Dict[str, Any]], context: Dict[str, Any]) -> Dict[
     for i, call in enumerate(calls or []):
         dom      = normalize_domain(call.get("domain_id", ""))
         cap      = _normalize_cap(call.get("capability", ""))
-        args     = dict(call.get("args") or {})
+        args     = _normalize_args(dom, cap, dict(call.get("args") or {}))
         strategy = (call.get("strategy") or "deterministic").strip().lower()
-        key      = f"{dom}.{cap}[{i}]"
+
+        key = f"{dom}.{cap}[{i}]"
 
         # --------------------- RAG lane (explicit) ---------------------
         if strategy.startswith("rag"):
@@ -135,7 +163,10 @@ def execute_calls(calls: List[Dict[str, Any]], context: Dict[str, Any]) -> Dict[
                 )
                 results[key] = {"deterministic": det_res, "fallback": rag_res}
             except Exception as e:
-                results[key] = {"deterministic": det_res, "fallback": {"error": f"rag_error: {type(e).__name__}: {e}"}}
+                results[key] = {
+                    "deterministic": det_res,
+                    "fallback": {"error": f"rag_error: {type(e).__name__}: {e}"}
+                }
         else:
             results[key] = det_res
 

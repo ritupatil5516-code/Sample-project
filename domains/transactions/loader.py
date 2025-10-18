@@ -74,3 +74,18 @@ def load_transactions(account_id: str) -> List[Dict[str, Any]]:
         r.setdefault("accountId", account_id)
 
     return rows
+
+
+# transactions.py
+from typing import List, Dict, Any
+
+_VECTOR = None  # inject LlamaIndex / FAISS retriever at startup if you like
+
+def load(account_id: str, cfg: dict) -> List[Dict[str, Any]]:
+    return _read_json(cfg, account_id, "transactions.json")
+
+def search(query: str, k: int = 12, alternates=None, must_include=None):
+    if _VECTOR is None:
+        raise RuntimeError("No vector attached")
+    # return list of {"score": float, "text": str, "payload": row}
+    return _VECTOR.search(query, k=k)
