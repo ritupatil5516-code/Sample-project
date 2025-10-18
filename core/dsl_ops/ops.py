@@ -86,19 +86,59 @@ def get_field(*, domain: str, data: Any, args: Dict[str, Any], plugin, scratch: 
             return {"error": "domain expects dict"}
         return {"value": _get_path(data, field)}
 
+def _passes_where(row: Dict[str, Any], where: Dict[str, Any]) -> bool:
+    if not where:
+        return True
+    for k, cond in (where or {}).items():
+        v = row.get(k)
+        if isinstance(cond, dict):
+            # numeric comparisons: {">": 0}, {">=": 10}, {"=": 0}
+            for op, rhs in cond.items():
+                try:
+                    fv = float(v) if v is not None else None
+                    fr = float(rhs)
+                except Exception:
+                    return False
+                if op == ">" and not (fv is not None and fv >  fr): return False
+                if op == ">=" and not (fv is not None and fv >= fr): return False
+                if op == "=" and not (fv == fr): return False
+                if op == "<" and not (fv is not None and fv <  fr): return False
+                if op == "<=" and not (fv is not None and fv <= fr): return False
+        else:
+            # equality / contains for strings
+            if isinstance(cond, str):
+                if str(cond).lower() not in str(v).lower():
+                    return False
+            else:
+                if v != cond:
+                    return False
+    return True
+
+def _sort_key(row: Dict[str, Any], field: str):
+    # works for ISO datetime or plain numbers; fall back to raw
+    val = row.get(field)
+    if isinstance(val, (int, float)):
+        return val
+    if isinstance(val, str):
+        # prioritize ISO datetimes lexicographically
+        return val
+    return ""
+
 def find_latest(*, domain: str, data: Any, args: Dict[str, Any], plugin, scratch: Dict[str, Any]) -> Dict[str, Any]:
-    rows: List[Dict[str, Any]] = data or []
-    if not isinstance(rows, list):
-        return {"error": "find_latest expects list domain"}
+    rows: List[Dict[str, Any]] = plugin.rows(data)
     where = args.get("where") or {}
-    rows = [r for r in rows if _match_row(domain, r, where, plugin)]
-    if not rows:
+    field = args.get("field") or plugin.default_timestamp
+
+    filt = [r for r in rows if _passes_where(r, where)]
+    if not filt:
         return {"value": None, "row": None, "trace": {"count": 0, "where": where}}
-    ts_keys = getattr(plugin, "timestamp_keys", []) or []
-    latest = max(rows, key=lambda r: _pick_ts(r, ts_keys))
-    field = (args.get("field") or "").strip()
-    field = (getattr(plugin, "ALIASES", {}) or {}).get(field, field)
-    return {"value": _get_path(latest, field), "row": latest, "trace": {"count": len(rows), "where": where}}
+
+    row = max(filt, key=lambda r: _sort_key(r, field))
+    return {
+        "value": row.get(field),
+        "row": row,
+        "trace": {"count": len(filt), "where": where, "field": field}
+    }
 
 def sum_where(*, domain: str, data: Any, args: Dict[str, Any], plugin, scratch: Dict[str, Any]) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = data or []

@@ -63,23 +63,43 @@ def _render_get_field(value: Any) -> str:
         return _fmt_money(value) if abs(float(value)) >= 1 else str(value)
     return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
 
+def _first_present_number(row: Dict[str, Any], keys: List[str]):
+    """Return first numeric value (prefer > 0); if none >0, return the first numeric even if 0."""
+    first_numeric = None
+    for k in keys:
+        v = row.get(k)
+        try:
+            f = float(v)
+        except Exception:
+            continue
+        if first_numeric is None:
+            first_numeric = f
+        if f > 0:
+            return f
+    return first_numeric
+
 def _render_find_latest(payload: Dict[str, Any], domain: str) -> str:
-    """
-    Special phrasing for statements interest questions:
-    - If domain == 'statements' and row has interestCharged, include amount + closing date.
-    Generic fallback otherwise.
-    """
     row = payload.get("row") or {}
-    val = payload.get("value")
     ts = _pick_latest_timestamp(row)
     if domain == "statements":
-        amt = row.get("interestCharged")
-        if amt is not None:
-            date = row.get("closingDateTime") or ts
-            s_date = _fmt_dt_iso(date) if date else ""
+        # Try common interest keys
+        interest_keys = [
+            "interestCharged", "totalInterestCharged", "interestAmount",
+            "financeCharge", "totalFinanceCharge", "totalInterest", "totalTrailingInterest"
+        ]
+        amt = _first_present_number(row, interest_keys)
+        date = row.get("closingDateTime") or ts
+        s_date = _fmt_dt_iso(date) if date else ""
+
+        if amt is None:
+            # no recognizable interest fields
+            return f"Latest statement{(' on ' + s_date) if s_date else ''}; no interest field found."
+        if amt > 0:
             return f"You were charged interest of {_fmt_money(amt)}" + (f" on {s_date}." if s_date else ".")
-    # generic phrasing
-    head = _render_get_field(val)
+        # amt == 0 → clarify
+        return f"Latest statement{(' on ' + s_date) if s_date else ''} shows $0.00 interest."
+    # generic fallback
+    head = _render_get_field(payload.get("value"))
     return f"{head}" + (f" (as of {ts})" if ts else "")
 
 def _render_sum_where(payload: Dict[str, Any]) -> str:
