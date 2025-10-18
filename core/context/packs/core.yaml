@@ -6,18 +6,24 @@ planner_rules:
     # generic time words
     recency: ["last", "latest", "recent", "most recent", "recently"]
     period_words: ["month", "year", "quarter", "cycle", "statement", "period"]
+
     # money verbs
     spend_words: ["spend", "spent", "purchases", "charges", "debits"]
     refund_words: ["refund", "refunded", "credit", "reversal", "chargeback"]
+
     # payment verbs
     payment_words: ["payment", "paid", "pay", "remit"]
+
     # list verbs
     list_words: ["list", "show", "display"]
+
     # domain nouns
     tx_words: ["transaction", "transactions", "purchase", "purchases", "charge", "charges"]
     stmt_words: ["statement", "cycle", "period", "closing"]
     acct_words: ["account", "status", "balance", "credit", "limit", "utilization", "apr", "due"]
     policy_words: ["policy", "handbook", "agreement", "rules", "fee", "fees", "interest policy"]
+
+    # extra intent hints
     merchant_hint: ["merchant", "store", "vendor", "shop", "at", "from"]
     category_hint: ["category", "categories"]
     rideshare_words: ["uber", "lyft", "rideshare"]
@@ -26,6 +32,13 @@ planner_rules:
     decline_words: ["declined", "failed", "rejected"]
     returned_payment_words: ["returned", "failed", "nsf"]
     reversed_words: ["reversed", "chargeback", "dispute"]
+
+    # commonly referenced but missing earlier
+    interest: ["interest", "finance charge", "trailing interest"]
+    most: ["most", "biggest", "largest", "top", "highest"]
+    average: ["average", "avg", "mean"]
+    compare: ["compare", "vs", "versus", "difference"]
+    late: ["late", "late fee", "past due"]
 
   # --- default time interpretations when none provided in question ---
   defaults:
@@ -81,15 +94,15 @@ planner_rules:
 
     # ------------------------------- FIND LATEST --------------------------------
     - name: latest_posted_transaction
-      must: ["recency", "tx_words]
+      must: ["recency", "tx_words"]
       call: {domain_id: transactions, capability: find_latest, args: {field: postedDateTime}}
 
     - name: latest_payment_with_post_date
-      must: ["recency", "payment_words]
+      must: ["recency", "payment_words"]
       call: {domain_id: payments, capability: find_latest, args: {field: paymentPostedDateTime}}
 
     - name: latest_statement_period
-      must: ["recency", "stmt_words]
+      must: ["recency", "stmt_words"]
       call: {domain_id: statements, capability: find_latest, args: {field: closingDateTime}}
 
     # ------------------------------ SUMS & AGGREGATES ---------------------------
@@ -297,53 +310,53 @@ planner_rules:
     # ------------------------------ POLICY / HANDBOOK ---------------------------
     - name: policy_late_fee
       must: ["policy_words", "late"]
-      strategy: rag:knowledge
+      strategy: "rag:knowledge"
       call: {domain_id: knowledge, capability: handbook_answer, args: {topic: "late fees"}}
 
     - name: policy_dispute_chargeback
       must: ["policy_words", "chargeback"]
-      strategy: rag:knowledge
+      strategy: "rag:knowledge"
       call: {domain_id: knowledge, capability: handbook_answer, args: {topic: "dispute / chargeback"}}
 
     - name: policy_interest_calc
       must: ["policy_words", "interest"]
-      strategy: rag:knowledge
+      strategy: "rag:knowledge"
       call: {domain_id: knowledge, capability: handbook_answer, args: {topic: "interest calculation"}}
 
     - name: policy_miss_payment
       must: ["policy_words", "miss", "payment"]
-      strategy: rag:knowledge
+      strategy: "rag:knowledge"
       call: {domain_id: knowledge, capability: handbook_answer, args: {topic: "missed payment"}}
 
     - name: policy_cash_advance
       must: ["policy_words", "cash", "advance"]
-      strategy: rag:knowledge
+      strategy: "rag:knowledge"
       call: {domain_id: knowledge, capability: handbook_answer, args: {topic: "cash advance interest and fees"}}
 
     # ------------------------------ UNIFIED RAG ---------------------------------
     - name: why_interest_last_month
       must: ["why", "interest", "month"]
-      strategy: rag:unified
+      strategy: "rag:unified"
       call: {domain_id: rag, capability: unified_answer, args: {focus: "interest"}}
 
     - name: trailing_interest_next_cycle
       must: ["interest", "trailing", "next"]
-      strategy: rag:unified
+      strategy: "rag:unified"
       call: {domain_id: rag, capability: unified_answer, args: {focus: "trailing interest"}}
 
     - name: annual_fee_policy_check
       must: ["annual", "fee"]
-      strategy: rag:unified
+      strategy: "rag:unified"
       call: {domain_id: rag, capability: unified_answer, args: {focus: "annual fee"}}
 
     - name: foreign_txn_fees
       must: ["foreign", "transaction", "fee"]
-      strategy: rag:unified
+      strategy: "rag:unified"
       call: {domain_id: rag, capability: unified_answer, args: {focus: "foreign transactions"}}
 
     - name: return_interest_expectation
       must: ["return", "interest"]
-      strategy: rag:unified
+      strategy: "rag:unified"
       call: {domain_id: rag, capability: unified_answer, args: {focus: "returns & interest"}}
 
     # ------------------------------ COMPARISONS ---------------------------------
@@ -368,7 +381,6 @@ planner_rules:
 
     # ------------------------------ MULTI-TURN / MEMORY -------------------------
     # Planner doesn’t need special rules here; the runtime memory filters last results.
-    # Keep the generic routes above; memory layer narrows list/sum on follow-ups.
 
     # ------------------------------ AMBIGUITY -----------------------------------
     - name: ambiguous_spend_default_last12m
@@ -423,7 +435,7 @@ planner_rules:
       call:
         domain_id: account_summary
         capability: get_field
-        args: {field: "persons[0].personName"}
+        args: {field: "persons[0].personName"}   # dotted path supported by executor
 
     - name: pending_vs_posted_counts_last_month
       must: ["pending", "posted", "counts", "month"]
@@ -474,15 +486,15 @@ planner_rules:
     # ------------------------------ STRESS / LONG CONTEXT -----------------------
     - name: summarize_spend_last12m
       must: ["summarize", "spend_words"]
-      strategy: rag:unified
+      strategy: "rag:unified"
       call: {domain_id: rag, capability: unified_answer, args: {focus: "spending trends last 12 months"}}
 
     - name: budget_insight_next_month
       must: ["budget", "save"]
-      strategy: rag:unified
+      strategy: "rag:unified"
       call: {domain_id: rag, capability: unified_answer, args: {focus: "budget insight"}}
 
     - name: interest_reasons_with_sources
       must: ["reasons", "interest"]
-      strategy: rag:unified
+      strategy: "rag:unified"
       call: {domain_id: rag, capability: unified_answer, args: {focus: "interest reasons with sources"}}
