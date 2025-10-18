@@ -4,38 +4,47 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import yaml
 
-# Your existing helpers (keep these imports the same as in your project)
+# Context builders (keep your originals)
 from core.context.builder import build_context
 from core.context.hints import build_hint_for_question
 
-# Runtime LLM factory (set up during FastAPI startup)
-# Must expose RUNTIME.chat() -> an LLM client that supports .invoke(messages) or returns an object with .content
-from src.core.runtime import RUNTIME  # adjust import if your runtime module lives elsewhere
+# Runtime LLM (set in FastAPI startup)
+from src.core.runtime import RUNTIME  # expose .chat() LangChain ChatOpenAI (or equivalent)
+
+# -----------------------------------------------------------------------------#
+# Limits & aliases
+# -----------------------------------------------------------------------------#
+
+ALLOWED_DOMAINS = {"transactions", "payments", "statements", "accounts"}
+DOMAIN_ALIASES = {
+    "account_summary": "accounts",
+    "account": "accounts",
+    "summary": "accounts",
+}
+
+PACK_PATH = Path("core/context/packs/core.yaml")
+
+WORD_RE = re.compile(r"[a-z0-9]+", re.I)
 
 
-# ------------------------------- file loaders ---------------------------------
-
-_PACK_PATH = Path("core/context/packs/core.yaml")
-
+# -----------------------------------------------------------------------------#
+# Pack / rules loading
+# -----------------------------------------------------------------------------#
 
 def _read_pack() -> Dict[str, Any]:
-    """
-    Load the core planning pack (system text, glossary, reasoning, planner rules, contract).
-    """
-    if not _PACK_PATH.exists():
+    if not PACK_PATH.exists():
         return {}
     try:
-        return yaml.safe_load(_PACK_PATH.read_text(encoding="utf-8")) or {}
+        return yaml.safe_load(PACK_PATH.read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
 
 
-def _extract_planner_rules(pack: Dict[str, Any]) -> Dict[str, Any]:
-    """Return just the planner_rules block (synonyms, defaults, routes)."""
+def _planner_rules(pack: Dict[str, Any]) -> Dict[str, Any]:
     pr = (pack.get("planner_rules") or {}) if isinstance(pack, dict) else {}
     pr.setdefault("synonyms", {})
     pr.setdefault("defaults", {})
@@ -43,29 +52,19 @@ def _extract_planner_rules(pack: Dict[str, Any]) -> Dict[str, Any]:
     return pr
 
 
-# ------------------------------ tiny text utils -------------------------------
-
-_WORD_RE = re.compile(r"[a-z0-9]+", re.I)
-
+# -----------------------------------------------------------------------------#
+# Text helpers
+# -----------------------------------------------------------------------------#
 
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
 
 def _tokens(s: str) -> List[str]:
-    return _WORD_RE.findall(_norm(s))
-
-
-def _contains_any(tokens: List[str], bag: List[str]) -> bool:
-    st = set(tokens)
-    return any(w in st for w in bag)
+    return WORD_RE.findall(_norm(s))
 
 
 def _expand_syn_bucket(bucket: Any) -> List[str]:
-    """
-    bucket may be ["recent","latest"] or {"recent":["latest","most recent"]}.
-    We always return a flat list of keywords in lowercase.
-    """
     if isinstance(bucket, list):
         return [_norm(x) for x in bucket if x]
     if isinstance(bucket, dict):
@@ -79,77 +78,15 @@ def _expand_syn_bucket(bucket: Any) -> List[str]:
 
 
 def _resolve_synonyms(tokens: List[str], synonyms: Dict[str, Any]) -> Dict[str, bool]:
-    """
-    Map each synonym bucket name -> True/False if present in the question.
-    """
     flags: Dict[str, bool] = {}
+    st = set(tokens)
     for name, bucket in (synonyms or {}).items():
-        bag = _expand_syn_bucket(bucket)
-        flags[name] = _contains_any(tokens, bag)
+        bag = set(_expand_syn_bucket(bucket))
+        flags[name] = any(b in st for b in bag)
     return flags
 
 
-# ------------------------------ arg templating --------------------------------
-
-_TMPL_RE = re.compile(r"\$\{([A-Z0-9_\-\*]+)\}")
-
-def _infer_date_defaults(q: str, defaults: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Very small heuristics for date placeholders:
-      ${YYYY-MM}, ${YYYY-Q*}, LAST_MONTH, PREV_MONTH, THIS_YEAR, LAST_12M
-    You can expand this as needed.
-    """
-    qn = _norm(q)
-    out: Dict[str, str] = {}
-    # YYYY-MM in text?
-    m = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", qn)
-    if m:
-        out["YYYY-MM"] = f"{m.group(1)}-{m.group(2)}"
-    # quarter like 2025 q3
-    mq = re.search(r"(20\d{2})\s*[- ]?q([1-4])", qn)
-    if mq:
-        out["YYYY-Q*"] = f"{mq.group(1)}-Q{mq.group(2)}"
-    return out
-
-
-def _fill_templates(obj: Any, question: str, defaults: Dict[str, Any]) -> Any:
-    """
-    Recursively replace ${TOKENS} in args with inferred values or defaults.
-    """
-    date_inf = _infer_date_defaults(question, defaults)
-
-    def _subst(s: str) -> str:
-        def repl(m):
-            key = m.group(1)
-            # Prefer inferred
-            if key in date_inf:
-                return date_inf[key]
-            # Fallback default-> exact token
-            # e.g., no_period_for_spend -> LAST_12M, but we only see literal tokens like LAST_12M in routes
-            # so if token itself is a named default, use that value
-            return defaults.get(key, key)
-        return _TMPL_RE.sub(repl, s)
-
-    if isinstance(obj, str):
-        return _subst(obj)
-    if isinstance(obj, list):
-        return [_fill_templates(x, question, defaults) for x in obj]
-    if isinstance(obj, dict):
-        return {k: _fill_templates(v, question, defaults) for k, v in obj.items()}
-    return obj
-
-
-# ------------------------------ rule-based plan -------------------------------
-
-def _must_tokens_present(
-    q_tokens: List[str],
-    syn_flags: Dict[str, bool],
-    must: List[str],
-) -> bool:
-    """
-    'must' contains literal words OR synonym-bucket names.
-    If a token exists in synonyms dict, we check its flag; else check literal in q_tokens.
-    """
+def _must_ok(q_tokens: List[str], syn_flags: Dict[str, bool], must: List[str]) -> bool:
     st = set(q_tokens)
     for m in must or []:
         m = _norm(m)
@@ -162,196 +99,276 @@ def _must_tokens_present(
     return True
 
 
-def _try_plan_from_rules(question: str, rules_pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    tokens = _tokens(question)
-    synonyms = rules_pack.get("synonyms") or {}
-    defaults = rules_pack.get("defaults") or {}
-    routes = rules_pack.get("routes") or []
+# -----------------------------------------------------------------------------#
+# Templating minimal (YYYY-MM, YYYY-Q*)
+# -----------------------------------------------------------------------------#
 
-    syn_flags = _resolve_synonyms(tokens, synonyms)
+_TMPL_RE = re.compile(r"\$\{([A-Z0-9_\-\*]+)\}")
+
+def _infer_dates(question: str) -> Dict[str, str]:
+    q = _norm(question)
+    out: Dict[str, str] = {}
+    m = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", q)
+    if m:
+        out["YYYY-MM"] = f"{m.group(1)}-{m.group(2)}"
+    mq = re.search(r"(20\d{2})\s*[- ]?q([1-4])", q)
+    if mq:
+        out["YYYY-Q*"] = f"{mq.group(1)}-Q{mq.group(2)}"
+    return out
+
+
+def _fill_templates(obj: Any, question: str, defaults: Dict[str, Any]) -> Any:
+    inferred = _infer_dates(question)
+
+    def sub_once(s: str) -> str:
+        def repl(m):
+            key = m.group(1)
+            if key in inferred:
+                return inferred[key]
+            return str(defaults.get(key, key))
+        return _TMPL_RE.sub(repl, s)
+
+    if isinstance(obj, str):
+        return sub_once(obj)
+    if isinstance(obj, list):
+        return [_fill_templates(x, question, defaults) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _fill_templates(v, question, defaults) for k, v in obj.items()}
+    return obj
+
+
+# -----------------------------------------------------------------------------#
+# Strategy selection
+# -----------------------------------------------------------------------------#
+
+EXPLAIN_WORDS = {"why", "explain", "because", "reason"}
+POLICY_WORDS = {"policy", "handbook", "agreement", "fee", "fees", "interest", "trailing"}
+
+def _choose_strategy(question: str, explicit: Optional[str]) -> str:
+    """
+    Returns one of: 'deterministic', 'rag:unified', 'rag:knowledge'
+    - If route provides explicit strategy -> honor it.
+    - Else, if question looks explanatory/policy-like -> rag:unified
+    - Otherwise -> deterministic
+    """
+    if explicit:
+        return explicit
+    toks = set(_tokens(question))
+    if (toks & EXPLAIN_WORDS) or (toks & POLICY_WORDS):
+        # default to unified so we can blend account JSON + policy
+        return "rag:unified"
+    return "deterministic"
+
+
+# -----------------------------------------------------------------------------#
+# Rule-first planner
+# -----------------------------------------------------------------------------#
+
+def _normalize_domain(dom: str) -> str:
+    d = _norm(dom)
+    d = DOMAIN_ALIASES.get(d, d)
+    # clamp to allowed; default to 'accounts' if unknown
+    return d if d in ALLOWED_DOMAINS else "accounts"
+
+
+def _plan_from_rules(question: str, rules: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    tokens = _tokens(question)
+    syn = rules.get("synonyms") or {}
+    defaults = rules.get("defaults") or {}
+    routes = rules.get("routes") or []
+
+    syn_flags = _resolve_synonyms(tokens, syn)
 
     for r in routes:
         must = r.get("must") or []
-        if not _must_tokens_present(tokens, syn_flags, must):
+        if not _must_ok(tokens, syn_flags, must):
             continue
 
-        call = r.get("call") or {}
-        # Deep copy + template fill
-        call = json.loads(json.dumps(call))
+        call = json.loads(json.dumps(r.get("call") or {}))  # deep copy
         call["args"] = _fill_templates(call.get("args") or {}, question, defaults)
 
-        plan: Dict[str, Any] = {
+        # normalize domain strictly
+        dom = _normalize_domain(call.get("domain_id", ""))
+        call["domain_id"] = dom
+
+        # ensure strategy
+        call_strategy = _choose_strategy(question, r.get("strategy"))
+        call["strategy"] = call_strategy
+
+        plan = {
             "intent": r.get("name") or "unknown",
             "calls": [call],
             "must_produce": [],
             "risk_if_missing": [],
+            "strategy": call_strategy,  # mirror at plan level for convenience
         }
-        # pass through strategy if present (e.g., "rag:unified")
-        if r.get("strategy"):
-            plan["strategy"] = str(r["strategy"])
-            # also copy onto the call so the executor can branch per-call if needed
-            plan["calls"][0]["strategy"] = str(r["strategy"])
         return plan
 
     return None
 
 
-# ------------------------------ LLM fallback ----------------------------------
+# -----------------------------------------------------------------------------#
+# LLM fallback (constrained)
+# -----------------------------------------------------------------------------#
 
-def _build_chat_messages(ctx: Dict[str, Any], pack: Dict[str, Any], question: str, rules_pack: Dict[str, Any], hint: Optional[str]) -> List[Dict[str, Any]]:
-    """
-    Build a conservative prompt for the planner LLM.
-    We include:
-      - system pack text (system + glossary + reasoning)
-      - planner contract from pack
-      - a few inline examples if you keep them elsewhere (optional)
-    """
-    sys_parts: List[str] = []
+def _build_llm_messages(ctx: Dict[str, Any], pack: Dict[str, Any], question: str, hint: Optional[str]) -> List[Dict[str, Any]]:
+    system_lines: List[str] = []
+
+    # Core system / glossary / reasoning from pack
     if pack.get("system"):
-        sys_parts.append(str(pack["system"]).strip())
-    if pack.get("glossary"):
-        gl = pack["glossary"]
-        if isinstance(gl, list):
-            sys_parts.append("Glossary:\n- " + "\n- ".join(map(str, gl)))
-    if pack.get("reasoning"):
-        rs = pack["reasoning"]
-        if isinstance(rs, list):
-            sys_parts.append("Reasoning rules:\n- " + "\n- ".join(map(str, rs)))
+        system_lines.append(str(pack["system"]).strip())
 
-    planner_contract = (pack.get("planner_contract") or
-                        "Return a strict JSON plan with {intent, calls:[{domain_id, capability, args}], must_produce:[], risk_if_missing:[]}. NO prose.")
-    sys_text = "\n\n".join(sys_parts + [str(planner_contract).strip()])
+    gl = pack.get("glossary")
+    if isinstance(gl, list) and gl:
+        system_lines.append("Glossary:\n- " + "\n- ".join(map(str, gl)))
+
+    rs = pack.get("reasoning")
+    if isinstance(rs, list) and rs:
+        system_lines.append("Reasoning rules:\n- " + "\n- ".join(map(str, rs)))
+
+    # Constrained planner contract
+    contract = (
+        "You must return ONLY a strict JSON object:\n"
+        "{\n"
+        '  "intent": "string",\n'
+        '  "calls": [\n'
+        '    {"domain_id":"transactions|payments|statements|accounts", "capability":"get_field|find_latest|sum_where|topk_by_sum|list_where|semantic_search|compare_periods", "args":{...}, "strategy":"deterministic|rag:unified|rag:knowledge"}\n'
+        "  ],\n"
+        '  "must_produce": [],\n'
+        '  "risk_if_missing": [],\n'
+        '  "strategy": "deterministic|rag:unified|rag:knowledge"\n'
+        "}\n"
+        "- Domains allowed: transactions, payments, statements, accounts (no others!)\n"
+        "- If the question asks WHY/EXPLAIN or cites policy/handbook/fees/interest policy, set strategy to rag:unified or rag:knowledge.\n"
+        "- Otherwise set strategy to deterministic.\n"
+        "- Do NOT include markdown fences or commentary."
+    )
+    system_lines.append(contract)
 
     messages: List[Dict[str, Any]] = []
-    # context system (if your builder emits it)
     if ctx and ctx.get("system"):
         messages.append({"role": "system", "content": ctx["system"]})
-    # additional context msgs from your builder (optional)
     for m in (ctx.get("context_msgs") or []):
         if isinstance(m, dict) and m.get("role") and m.get("content"):
             messages.append({"role": m["role"], "content": m["content"]})
 
-    # core pack system + contract
-    messages.append({"role": "system", "content": sys_text})
+    messages.append({"role": "system", "content": "\n\n".join(system_lines)})
 
-    # add hint if any
     if hint:
         messages.append({"role": "system", "content": str(hint)})
 
-    # final user turn
     messages.append({
         "role": "user",
-        "content": (
-            "Return ONLY JSON. Do not include explanations or markdown code fences.\n\n"
-            f"Question: {question}"
-        )
+        "content": f"Question: {question}\nReturn ONLY the JSON plan described above."
     })
     return messages
 
 
-def _coerce_response_text(resp: Any) -> str:
-    """
-    Accept:
-      - string
-      - dict with 'content'
-      - LangChain BaseMessage with .content
-      - OpenAI httpx raw dict {choices[0].message.content}
-    Return a plain string.
-    """
+def _coerce_text(resp: Any) -> str:
     if resp is None:
         return ""
-    # LangChain / pydantic messages
     if hasattr(resp, "content") and isinstance(getattr(resp, "content"), str):
         return resp.content
-    # openai raw dict
     if isinstance(resp, dict):
-        # openai/chat-completions shape
         try:
             return resp["choices"][0]["message"]["content"]
         except Exception:
             pass
-        if "content" in resp and isinstance(resp["content"], str):
+        if isinstance(resp.get("content"), str):
             return resp["content"]
-    # string
     if isinstance(resp, str):
         return resp
     return str(resp)
 
 
-def _extract_json_block(s: str) -> str:
-    """Grab outermost {...} from possibly noisy LLM text."""
+def _extract_json(s: str) -> str:
     if not s:
         return ""
-    start = s.find("{")
-    end = s.rfind("}")
-    if start >= 0 and end >= 0 and end > start:
-        return s[start: end + 1]
-    return ""
+    i = s.find("{")
+    j = s.rfind("}")
+    return s[i:j + 1] if i >= 0 and j > i else ""
 
 
-# --------------------------------- Public API ---------------------------------
-
-def llm_plan(question: str) -> Dict[str, Any]:
-    """
-    Try rules first (from YAML pack). If nothing matches, fall back to the runtime LLM.
-    Always returns a dict with {intent, calls, must_produce, risk_if_missing}.
-    """
-    # Load pack + rules
-    pack = _read_pack()
-    rules = _extract_planner_rules(pack)
-
-    # 1) Rule-first planner
-    rule_plan = _try_plan_from_rules(question, rules)
-    if rule_plan:
-        return rule_plan
-
-    # 2) LLM fallback with your context builder / hinting
-    ctx = build_context(intent="planner", question=question, plan=None)
-    hint = build_hint_for_question(question)
-    messages = _build_chat_messages(ctx, pack, question, rules, hint)
-
-    # Call the runtime LLM (must be set up in runtime.startup)
-    llm = RUNTIME.chat()
-    # Support both: LangChain ChatOpenAI (expects list[dict] OK via LC’s conversion) or your own client.
-    try:
-        resp = llm.invoke(messages)  # LangChain style
-    except AttributeError:
-        # If it's your custom client with .complete(messages, temperature=0)
-        resp = getattr(llm, "complete")(messages, temperature=0)
-
-    raw_text = _coerce_response_text(resp)
-    json_block = _extract_json_block(raw_text)
-
-    try:
-        obj = json.loads(json_block)
-    except Exception:
-        # Safe default
-        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": []}
-
-    # Normalize
-    if not isinstance(obj, dict):
-        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": []}
-
-    obj.setdefault("intent", "unknown")
-    calls_in = obj.get("calls") or []
-    calls_out: List[Dict[str, Any]] = []
-    for c in calls_in:
+def _normalize_calls(calls_in: Any, question: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for c in (calls_in or []):
         if not isinstance(c, dict):
             continue
-        # normalize fields
-        dom = str(c.get("domain_id", "")).strip()
+        dom = _normalize_domain(c.get("domain_id", ""))
         cap = str(c.get("capability", "")).strip()
         args = c.get("args") or {}
         if not isinstance(args, dict):
             args = {}
-        call_norm = {"domain_id": dom, "capability": cap, "args": args}
-        # if planner added "strategy", keep it (executor can branch deterministic vs rag)
-        if "strategy" in c:
-            call_norm["strategy"] = str(c["strategy"])
-        calls_out.append(call_norm)
+        strat = _choose_strategy(question, c.get("strategy"))
 
-    obj["calls"] = calls_out
+        # clamp capabilities set (executor supports these)
+        allowed_caps = {
+            "get_field", "find_latest", "sum_where",
+            "topk_by_sum", "list_where", "semantic_search",
+            "compare_periods"
+        }
+        if cap not in allowed_caps:
+            # last resort: treat as list_where to avoid crash
+            cap = "list_where"
+
+        out.append({"domain_id": dom, "capability": cap, "args": args, "strategy": strat})
+    return out
+
+
+# -----------------------------------------------------------------------------#
+# Public API
+# -----------------------------------------------------------------------------#
+
+def llm_plan(question: str) -> Dict[str, Any]:
+    """
+    Rule-first plan. If no rule matches, fall back to LLM (constrained).
+    Always returns a normalized plan with allowed domains and an explicit strategy.
+    """
+    pack = _read_pack()
+    rules = _planner_rules(pack)
+
+    # 1) Try rules
+    plan = _plan_from_rules(question, rules)
+    if plan:
+        return plan
+
+    # 2) LLM fallback
+    ctx = build_context(intent="planner", question=question, plan=None)
+    hint = build_hint_for_question(question)
+    messages = _build_llm_messages(ctx, pack, question, hint)
+
+    llm = RUNTIME.chat()
+    try:
+        resp = llm.invoke(messages)  # LangChain ChatOpenAI path
+    except AttributeError:
+        resp = getattr(llm, "complete")(messages, temperature=0)  # custom client path
+
+    text = _coerce_text(resp)
+    js = _extract_json(text)
+
+    try:
+        obj = json.loads(js)
+    except Exception:
+        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": [], "strategy": "deterministic"}
+
+    if not isinstance(obj, dict):
+        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": [], "strategy": "deterministic"}
+
+    obj.setdefault("intent", "unknown")
     obj.setdefault("must_produce", [])
     obj.setdefault("risk_if_missing", [])
+
+    calls = _normalize_calls(obj.get("calls"), question)
+    obj["calls"] = calls
+
+    # plan-level strategy mirrors first call (or heuristic)
+    plan_strategy = _choose_strategy(question, obj.get("strategy"))
+    if calls:
+        plan_strategy = calls[0].get("strategy", plan_strategy)
+    obj["strategy"] = plan_strategy
+
+    # Final domain clamp (paranoia)
+    for c in obj["calls"]:
+        c["domain_id"] = _normalize_domain(c.get("domain_id", ""))
 
     return obj
