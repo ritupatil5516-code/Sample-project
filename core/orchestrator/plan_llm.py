@@ -1,250 +1,226 @@
-# core/orchestrator/plan_llm.py
 from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Use the one shared LLM configured at startup
-from src.core.runtime import RUNTIME
+import httpx
+import yaml
 
-# Optional (nice-to-have) context packs; safely ignored if not present
-try:
-    from core.context.builder import build_context  # type: ignore
-except Exception:  # pragma: no cover
-    def build_context(intent: str, question: str, plan: Optional[dict]) -> Dict[str, Any]:
-        return {"system": "You are a planner for a credit-card copilot.", "context_msgs": []}
+from core.context.builder import build_context
+from core.context.hints import build_hint_for_question
 
-try:
-    from core.context.hints import build_hint_for_question  # type: ignore
-except Exception:  # pragma: no cover
-    def build_hint_for_question(q: str) -> str:
-        return ""
+CORE_PACK = Path("core/context/packs/core.yaml")
+APP_CFG   = Path("config/app.yaml")
 
+# ------------------------------ tiny LLM client ------------------------------ #
 
-# ------------------------------ Planning contract ------------------------------
+class _LLMClient:
+    def __init__(self, api_base: str, api_key: str, model: str):
+        self.api_base = api_base.rstrip("/")
+        self.api_key = api_key
+        self.model = model
 
-SYSTEM_CONTRACT = (
-    "You are a planner for a credit-card copilot.\n"
-    "Given a user question, return STRICT JSON with this shape:\n"
-    "{\n"
-    '  "intent": string,\n'
-    '  "calls": [\n'
-    "    {\n"
-    '      "domain_id": string,             // one of: "transactions", "payments", "statements", "accounts", or "rag"\n'
-    '      "capability": string,            // deterministic DSL ops: "get_field", "find_latest", "sum_where", "topk_by_sum", "list_where";\n'
-    '                                       // if domain_id == "rag", capability can be "unified_rag" and args can include {"account_id": "..."}\n'
-    '      "args": object,                  // op-specific args (see below)\n'
-    '      "strategy": "deterministic" | "rag" | "auto"\n'
-    "    }\n"
-    "  ],\n"
-    '  "must_produce": [],\n'
-    '  "risk_if_missing": []\n'
-    "}\n\n"
-    "Rules:\n"
-    "- Prefer strategy = \"deterministic\" when the question maps to exact fields or precise tabular logic.\n"
-    "- Use strategy = \"rag\" for policy/handbook questions, fuzzy reasoning, or multi-document explanations.\n"
-    "- Use strategy = \"auto\" if you are unsure; executor will try deterministic first then RAG fallback.\n"
-    "- domains:\n"
-    "  * accounts (dict-shaped): fields like accountStatus, currentBalance, availableCredit, creditLimit\n"
-    "  * transactions/payments/statements (list-shaped)\n"
-    "- deterministic DSL ops & typical args:\n"
-    "  * get_field     {\"field\": \"accountStatus\"}\n"
-    "  * find_latest   {\"field\": \"amount\", \"where\": {\"merchant\": \"apple*\"}}\n"
-    "  * sum_where     {\"sum_field\": \"amount\", \"where\": {\"category\": \"GROCERIES\"}}\n"
-    "  * topk_by_sum   {\"key_field\": \"merchantName\", \"sum_field\": \"amount\", \"where\": {...}, \"k\": 5}\n"
-    "  * list_where    {\"where\": {...}, \"per_key\": \"merchantName\", \"limit_per_key\": 2}\n"
-    "- Aliases you may reference in args.where or field names: status→accountStatus, balance→currentBalance, available→availableCredit, merchant→merchantName, date→postedDateTime.\n"
-    "- For policy/handbook/fees/eligibility questions, either set domain_id=\"rag\" with capability=\"unified_rag\" OR set a normal domain with strategy=\"rag\".\n"
-    "- Return ONLY JSON (no markdown, no prose, no code fences)."
-)
+    def complete(self, messages: List[Dict[str, Any]], model: Optional[str] = None, temperature: float = 0.0) -> str:
+        url = f"{self.api_base}/chat/completions"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {"model": model or self.model, "messages": messages, "temperature": float(temperature)}
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(url, headers=headers, json=payload)
+            if r.status_code >= 400:
+                raise RuntimeError(f"LLM {r.status_code}: {r.text}")
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
+
+# ------------------------------ config helpers ------------------------------ #
+
+def _read_yaml(p: Path) -> Dict[str, Any]:
+    if not p.exists(): return {}
+    try:
+        return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+def _read_app_cfg() -> Dict[str, Any]:
+    return _read_yaml(APP_CFG)
+
+def _read_core_pack() -> Dict[str, Any]:
+    return _read_yaml(CORE_PACK)
+
+def build_llm_from_config(cfg: Dict[str, Any]) -> _LLMClient:
+    llm_cfg = (cfg.get("llm") or {})
+    api_base = (llm_cfg.get("api_base") or llm_cfg.get("base_url") or "https://api.openai.com/v1").strip()
+    model    = (llm_cfg.get("model") or "gpt-4o-mini").strip()
+    key = (llm_cfg.get("api_key")
+           or (llm_cfg.get("api_key_env") and __import__("os").getenv(llm_cfg.get("api_key_env")))
+           or llm_cfg.get("key") or "")
+    key = (key or "").strip()
+    if not key:
+        raise RuntimeError("Missing LLM API key (set llm.api_key or export llm.api_key_env).")
+    if api_base and not (api_base.startswith("http://") or api_base.startswith("https://")):
+        api_base = "https://" + api_base
+    return _LLMClient(api_base=api_base, api_key=key, model=model)
+
+# ------------------------------ examples (small) ----------------------------- #
 
 EXAMPLES: List[Dict[str, Any]] = [
-    # 1) Direct account field → deterministic
     {
-        "intent": "account_status",
-        "calls": [
-            {"domain_id": "accounts", "capability": "get_field",
-             "args": {"field": "accountStatus"}, "strategy": "deterministic"}
-        ],
-        "must_produce": [],
-        "risk_if_missing": []
+        "intent": "get_account_status",
+        "calls": [{"domain_id": "account_summary", "capability": "get_field", "args": {"field": "status"}}],
+        "must_produce": [], "risk_if_missing": [], "strategy": "deterministic"
     },
-    # 2) Top merchants (12 months) → deterministic aggregation
     {
-        "intent": "top_merchants_12m",
-        "calls": [
-            {"domain_id": "transactions", "capability": "topk_by_sum",
-             "args": {"key_field": "merchantName", "sum_field": "amount",
-                      "where": {"status": "POSTED"}, "k": 5},
-             "strategy": "deterministic"}
-        ],
-        "must_produce": [],
-        "risk_if_missing": []
-    },
-    # 3) Policy/handbook question → RAG
-    {
-        "intent": "late_fee_policy",
-        "calls": [
-            {"domain_id": "rag", "capability": "unified_rag",
-             "args": {"account_id": null, "k": 6}, "strategy": "rag"}
-        ],
-        "must_produce": [],
-        "risk_if_missing": []
-    },
-    # 4) Ambiguous → auto (executor may fallback to RAG)
-    {
-        "intent": "spend_pattern",
-        "calls": [
-            {"domain_id": "transactions", "capability": "list_where",
-             "args": {"where": {"amount": {"$gte": 100}}}, "strategy": "auto"}
-        ],
-        "must_produce": [],
-        "risk_if_missing": []
+        "intent": "last_interest_charge",
+        "calls": [{"domain_id": "statements", "capability": "find_latest",
+                   "args": {"field": "closingDateTime", "where": {"interestCharged": {">": 0}}}}],
+        "must_produce": [], "risk_if_missing": [], "strategy": "deterministic"
     },
 ]
-
 
 def _examples_block() -> str:
     return "\n".join(json.dumps(e, separators=(",", ":")) for e in EXAMPLES)
 
-
-# ------------------------------ Utilities ------------------------------
-
-def _outer_json(text: str) -> str:
-    """Extract outermost {...} to survive accidental extra tokens or code fences."""
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end >= 0 and end > start:
-        return text[start : end + 1]
-    return text.strip()
-
-def _shape_plan(obj: Any) -> Dict[str, Any]:
-    """Ensure the planner output has the expected shape & defaults."""
-    if not isinstance(obj, dict):
-        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": []}
-
-    intent = obj.get("intent") or "unknown"
-    must = obj.get("must_produce") or []
-    risk = obj.get("risk_if_missing") or []
-
-    shaped_calls: List[Dict[str, Any]] = []
-    for c in obj.get("calls") or []:
-        if not isinstance(c, dict):
+def _coerce_chat_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for m in msgs or []:
+        if not isinstance(m, dict): continue
+        role = m.get("role")
+        content = m.get("content")
+        if content is None: continue
+        if isinstance(content, (str, list)):
+            out.append({"role": role, "content": content}); continue
+        if isinstance(content, dict):
+            inner = content.get("content") if "content" in content else None
+            out.append({"role": role, "content": inner if isinstance(inner, str) else json.dumps(content, ensure_ascii=False)})
             continue
-        dom = str(c.get("domain_id", "")).strip().lower().replace("-", "_")
-        if dom in ("account_summary", "account"):  # normalize
-            dom = "accounts"
-        cap = str(c.get("capability", "")).strip().lower().replace("-", "_")
-        args = c.get("args") or {}
-        if not isinstance(args, dict):
-            args = {}
-        strategy = str(c.get("strategy") or "auto").strip().lower()
-        if strategy not in ("deterministic", "rag", "auto"):
-            strategy = "auto"
-        shaped_calls.append({"domain_id": dom, "capability": cap, "args": args, "strategy": strategy})
+        out.append({"role": role, "content": str(content)})
+    return out
 
-    return {
-        "intent": intent,
-        "calls": shaped_calls,
-        "must_produce": must if isinstance(must, list) else [],
-        "risk_if_missing": risk if isinstance(risk, list) else [],
-    }
+# ----------------------- rules sourced from core.yaml ------------------------ #
 
+def _extract_planner_rules(core_pack: Dict[str, Any]) -> Dict[str, Any]:
+    pr = core_pack.get("planner_rules") or {}
+    pr.setdefault("synonyms", {}); pr.setdefault("routes", [])
+    return pr
 
-# ------------------------------ Heuristic fallback (no-LLM) ------------------------------
+def _token_present(q: str, tokens: List[str]) -> bool:
+    ql = " " + (q or "").lower() + " "
+    for raw in tokens or []:
+        t = (raw or "").strip().lower()
+        if not t: continue
+        if f" {t} " in ql or t in ql:
+            return True
+    return False
 
-_KEY_PATTS = [
-    (re.compile(r"\b(account\s*status)\b", re.I), lambda: {
-        "intent": "account_status",
-        "calls": [{"domain_id": "accounts", "capability": "get_field",
-                   "args": {"field": "accountStatus"}, "strategy": "deterministic"}],
-        "must_produce": [], "risk_if_missing": []
-    }),
-    (re.compile(r"\b(current\s*balance|available\s*credit)\b", re.I), lambda: {
-        "intent": "account_balance_or_available",
-        "calls": [{"domain_id": "accounts", "capability": "get_field",
-                   "args": {"field": "currentBalance"}, "strategy": "deterministic"}],
-        "must_produce": [], "risk_if_missing": []
-    }),
-    (re.compile(r"\b(where|did)\s+.*\b(spend|most)\b", re.I), lambda: {
-        "intent": "top_merchants",
-        "calls": [{"domain_id": "transactions", "capability": "topk_by_sum",
-                   "args": {"key_field": "merchantName", "sum_field": "amount",
-                            "where": {"status": "POSTED"}, "k": 5},
-                   "strategy": "deterministic"}],
-        "must_produce": [], "risk_if_missing": []
-    }),
-    (re.compile(r"\b(late fee|policy|agreement|handbook)\b", re.I), lambda: {
-        "intent": "policy_lookup",
-        "calls": [{"domain_id": "rag", "capability": "unified_rag",
-                   "args": {"account_id": None, "k": 6}, "strategy": "rag"}],
-        "must_produce": [], "risk_if_missing": []
-    }),
-]
+def try_plan_from_rules(question: str, rules: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    syn = rules.get("synonyms") or {}
+    for r in (rules.get("routes") or []):
+        must = r.get("must") or []
+        ok = True
+        for tag in must:
+            tokens = syn.get(tag) if tag in syn else [tag]
+            if not _token_present(question, tokens):
+                ok = False; break
+        if ok:
+            call = r.get("call") or {}
+            return {
+                "intent": r.get("name", "rule_match"),
+                "calls": [{
+                    "domain_id": call.get("domain_id", ""),
+                    "capability": call.get("capability", ""),
+                    "args": call.get("args", {}) or {}
+                }],
+                "must_produce": [],
+                "risk_if_missing": [],
+                "strategy": "deterministic"
+            }
+    return None
 
+# -------------------------- message construction ----------------------------- #
 
-def _fallback_plan(question: str) -> Dict[str, Any]:
-    for patt, make in _KEY_PATTS:
-        if patt.search(question or ""):
-            return make()
-    # last resort
-    return {
-        "intent": "unknown",
-        "calls": [{"domain_id": "rag", "capability": "unified_rag",
-                   "args": {"account_id": None, "k": 6}, "strategy": "auto"}],
-        "must_produce": [], "risk_if_missing": []
-    }
+def build_chat_messages(ctx: Dict[str, Any], core_pack: Dict[str, Any], question: str, rules: Dict[str, Any], hint: Optional[str]) -> List[Dict[str, Any]]:
+    sys_txt = (core_pack.get("system") or ctx.get("system") or "").strip()
+    glossary = core_pack.get("glossary") or []
+    reasoning = core_pack.get("reasoning") or []
+    planner_contract = (core_pack.get("planner_contract") or
+                        "Return ONLY JSON with {intent, calls, must_produce, risk_if_missing}. Prefer DSL ops.")
+    hint_msg = [{"role": "system", "content": hint}] if hint else []
 
+    extra_msgs: List[Dict[str, str]] = []
+    if glossary:
+        extra_msgs.append({"role": "system", "content": "Glossary:\n- " + "\n- ".join(map(str, glossary))})
+    if reasoning:
+        extra_msgs.append({"role": "system", "content": "Reasoning guide:\n- " + "\n- ".join(map(str, reasoning))})
 
-# ------------------------------ Public API ------------------------------
+    rules_yaml = yaml.safe_dump(rules, allow_unicode=True)
+    rules_msg = {"role": "system", "content": "Planner routing rules:\n\n" + rules_yaml}
+
+    messages: List[Dict[str, Any]] = (
+        [{"role": "system", "content": sys_txt}]
+        + ctx.get("context_msgs", [])
+        + extra_msgs
+        + hint_msg
+        + [rules_msg]
+        + [{"role": "system", "content": planner_contract}]
+        + [{
+            "role": "user",
+            "content": (
+                "Return ONLY JSON. Do not include explanations or markdown code fences.\n\n"
+                f"Examples:\n{_examples_block()}\n\n"
+                f"Question: {question}"
+            )
+        }]
+    )
+    return _coerce_chat_messages(messages)
+
+# --------------------------------- public API -------------------------------- #
 
 def llm_plan(question: str) -> Dict[str, Any]:
     """
-    Use the shared Chat LLM (RUNTIME.chat()) to produce a plan.
-    Falls back to simple heuristics if JSON parsing fails.
+    1) Read core pack (system+glossary+reasoning+planner_contract+planner_rules).
+    2) Try deterministic plan from planner_rules.
+    3) If no match, call the LLM planner (still guided by the same core pack).
     """
-    chat = RUNTIME.chat()  # langchain_openai.ChatOpenAI (already configured at startup)
+    cfg = _read_app_cfg()
+    core_pack = _read_core_pack()
+    rules = _extract_planner_rules(core_pack)
 
-    # Optional contextual packs
+    # Try rules first
+    rule_plan = try_plan_from_rules(question, rules)
+    if rule_plan:
+        return rule_plan
+
+    # Fall back to LLM (with packs)
+    llm = build_llm_from_config(cfg)
     ctx = build_context(intent="planner", question=question, plan=None)
     hint = build_hint_for_question(question)
-    ctx_msgs = ctx.get("context_msgs") or []
+    messages = build_chat_messages(ctx, core_pack, question, rules, hint)
 
-    # Build messages (LangChain Message objects are fine, but ChatOpenAI also accepts dicts)
-    messages: List[Dict[str, str]] = []
-    if ctx.get("system"):
-        messages.append({"role": "system", "content": str(ctx["system"])})
-    for m in ctx_msgs:
-        if isinstance(m, dict) and m.get("role") and m.get("content"):
-            messages.append({"role": m["role"], "content": m["content"]})
-    if hint:
-        messages.append({"role": "system", "content": hint})
-    messages.append({"role": "system", "content": SYSTEM_CONTRACT})
-    messages.append({
-        "role": "user",
-        "content": (
-            "Return ONLY JSON. Do not include explanations or markdown code fences.\n\n"
-            f"Examples:\n{_examples_block()}\n\n"
-            f"Question: {question}"
-        ),
-    })
-
-    # Call the shared LLM
-    resp = chat.invoke(messages)
-    raw = getattr(resp, "content", "") or str(resp)
-    text = _outer_json(raw)
+    raw = llm.complete(messages, model=(cfg.get("llm") or {}).get("model"), temperature=0.0)
+    s, e = raw.find("{"), raw.rfind("}")
+    if s >= 0 and e > s:
+        raw = raw[s:e + 1]
 
     try:
-        obj = json.loads(text)
-        return _shape_plan(obj)
+        obj = json.loads(raw)
     except Exception:
-        # Heuristic fallback to keep UX unblocked
-        return _fallback_plan(question)
+        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": [], "strategy": "llm"}
 
+    if not isinstance(obj, dict):
+        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": [], "strategy": "llm"}
 
-# Backwards-compatible entry point (your server calls make_plan(...))
-def make_plan(question: str, app_yaml_path: str = "config/app.yaml") -> Dict[str, Any]:
-    # We no longer need app_yaml_path here because RUNTIME holds config + clients.
-    # Kept in signature for compatibility with existing server code.
-    return llm_plan(question)
+    safe_calls: List[Dict[str, Any]] = []
+    for c in obj.get("calls") or []:
+        if isinstance(c, dict):
+            safe_calls.append({
+                "domain_id": c.get("domain_id", ""),
+                "capability": c.get("capability", ""),
+                "args": c.get("args", {}) if isinstance(c.get("args"), dict) else {}
+            })
+    obj["calls"] = safe_calls
+    obj.setdefault("intent", "unknown")
+    obj.setdefault("must_produce", [])
+    obj.setdefault("risk_if_missing", [])
+    obj.setdefault("strategy", "llm")
+    return obj

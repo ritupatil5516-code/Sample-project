@@ -1,63 +1,488 @@
-# core/context/packs/core.yaml
-system: |
-  You are the reasoning and planning engine for a Smart Finance Copilot.
-  You understand transactions, payments, statements, balances, and policies.
-  Your goal is to generate factual, deterministic answers from structured JSON data
-  and verified semantic indexes (knowledge and policy).
-  - If the data or policy context does not contain the requested information,
-    respond with: "I don’t know" or "No information found."
-  - Never fabricate numbers, merchants, or explanations.
-  - Do not speculate or infer causes outside the available data.
-  - Always prefer accuracy over completeness.
-  - Reject weird, unrelated, or non-financial queries with: "I do not have any information."
+planner_rules:
+  version: 2
 
-glossary:
-  - current balance: total owed including posted transactions and interest
-  - available credit: credit limit minus current balance
-  - statement: record of activity for one billing cycle
-  - payment: amount received to reduce balance
-  - transaction: a purchase, refund, or credit
-  - interest: finance charge applied when balance is carried
-  - trailing interest: residual interest after last payment
-  - grace period: time before interest applies if balance unpaid
-  - minimum payment: smallest amount due to keep account in good standing
-  - co-owner: another person equally responsible for account
+  # --- synonyms help the simple matcher fire the right rule(s) ---
+  synonyms:
+    # generic time words
+    recency: ["last", "latest", "recent", "most recent", "recently"]
+    period_words: ["month", "year", "quarter", "cycle", "statement", "period"]
+    # money verbs
+    spend_words: ["spend", "spent", "purchases", "charges", "debits"]
+    refund_words: ["refund", "refunded", "credit", "reversal", "chargeback"]
+    # payment verbs
+    payment_words: ["payment", "paid", "pay", "remit"]
+    # list verbs
+    list_words: ["list", "show", "display"]
+    # domain nouns
+    tx_words: ["transaction", "transactions", "purchase", "purchases", "charge", "charges"]
+    stmt_words: ["statement", "cycle", "period", "closing"]
+    acct_words: ["account", "status", "balance", "credit", "limit", "utilization", "apr", "due"]
+    policy_words: ["policy", "handbook", "agreement", "rules", "fee", "fees", "interest policy"]
+    merchant_hint: ["merchant", "store", "vendor", "shop", "at", "from"]
+    category_hint: ["category", "categories"]
+    rideshare_words: ["uber", "lyft", "rideshare"]
+    subscription_words: ["subscription", "recurring", "renewal"]
+    travel_words: ["travel", "airline", "hotel", "car rental"]
+    decline_words: ["declined", "failed", "rejected"]
+    returned_payment_words: ["returned", "failed", "nsf"]
+    reversed_words: ["reversed", "chargeback", "dispute"]
 
-reasoning:
-  - "If question includes 'last' or 'recent': pick the latest record by timestamp."
-  - "If question is conceptual (why/how/what does it mean): retrieve from knowledge index."
-  - "If asking about 'interest': use statements data and supplement with handbook context."
-  - "If unspecified period: default to most recent available statement."
-  - "If question involves available credit or current balance: use account_summary.json."
-  - "Never fabricate information; base all context on JSON or handbook knowledge."
+  # --- default time interpretations when none provided in question ---
+  defaults:
+    no_period_for_spend: "LAST_12M"
+    no_period_for_list: "LAST_12M"
+    no_period_for_compare_a: "LAST_MONTH"
+    no_period_for_compare_b: "PREV_MONTH"
 
-planner_contract: |
-  You must output a valid JSON plan in this format:
-  {
-    "intent": "string",
-    "calls": [
-      {"domain_id": "string", "capability": "string", "args": {"field": "value"}}
-    ],
-    "must_produce": [],
-    "risk_if_missing": []
-  }
-  - Each 'call' maps to a deterministic calculator or retrieval step.
-  - Domains: {transactions, payments, statements, account_summary, knowledge}
-  - Capabilities include:
-      - transactions: spend_in_period, list_over_threshold, purchases_in_cycle
-      - payments: last_payment, total_credited_year
-      - statements: total_interest, trailing_interest, interest_breakdown
-      - account_summary: current_balance, available_credit
-      - knowledge: interest_calculation, statement_cycle, minimum_payment, co_owner, late_fees
+  # --- routing rules ---
+  routes:
 
-domains:
-  - transactions
-  - payments
-  - statements
-  - account_summary
-  - knowledge
+    # ----------------- SMOKE / DIRECT FIELDS (account_summary) -----------------
+    - name: get_account_status
+      must: ["status"]
+      call: {domain_id: account_summary, capability: get_field, args: {field: status}}
 
-extras:
-  - "Knowledge index combines data/knowledge/handbook.md and Apple Card Agreement PDF."
-  - "If question is explanatory (why/how/what), retrieve top handbook or policy passages via FAISS."
-  - "Planner tokens: 4000; composer tokens: 3000."
+    - name: get_current_balance
+      must: ["balance"]
+      call: {domain_id: account_summary, capability: get_field, args: {field: currentBalance}}
+
+    - name: get_available_credit
+      must: ["credit"]
+      call: {domain_id: account_summary, capability: get_field, args: {field: availableCredit}}
+
+    - name: show_last_transaction
+      must: ["recency", "tx_words"]
+      call: {domain_id: transactions, capability: find_latest, args: {field: postedDateTime}}
+
+    - name: show_last_payment
+      must: ["recency", "payment_words"]
+      call: {domain_id: payments, capability: find_latest, args: {field: paymentPostedDateTime}}
+
+    # -------------------------- account_summary direct fields -------------------
+    - name: credit_limit
+      must: ["credit", "limit"]
+      call: {domain_id: account_summary, capability: get_field, args: {field: creditLimit}}
+
+    - name: minimum_payment_due
+      must: ["minimum", "payment"]
+      call: {domain_id: account_summary, capability: get_field, args: {field: minimumPaymentDue}}
+
+    - name: next_payment_due_date
+      must: ["due", "payment"]
+      call: {domain_id: account_summary, capability: get_field, args: {field: nextPaymentDueDate}}
+
+    - name: latest_statement_closing_date
+      must: ["recency", "stmt_words", "closing"]
+      call: {domain_id: statements, capability: find_latest, args: {field: closingDateTime}}
+
+    - name: apr_purchases
+      must: ["apr", "purchase"]
+      call: {domain_id: account_summary, capability: get_field, args: {field: aprPurchases}}
+
+    # ------------------------------- FIND LATEST --------------------------------
+    - name: latest_posted_transaction
+      must: ["recency", "tx_words]
+      call: {domain_id: transactions, capability: find_latest, args: {field: postedDateTime}}
+
+    - name: latest_payment_with_post_date
+      must: ["recency", "payment_words]
+      call: {domain_id: payments, capability: find_latest, args: {field: paymentPostedDateTime}}
+
+    - name: latest_statement_period
+      must: ["recency", "stmt_words]
+      call: {domain_id: statements, capability: find_latest, args: {field: closingDateTime}}
+
+    # ------------------------------ SUMS & AGGREGATES ---------------------------
+    - name: spend_in_ym
+      must: ["spend_words"]
+      may:  ["period_words"]
+      call:
+        domain_id: transactions
+        capability: sum_where
+        args:
+          where: {"period": "${YYYY-MM}"}
+          value_path: amount
+
+    - name: spend_this_year
+      must: ["spend_words", "year"]
+      call:
+        domain_id: transactions
+        capability: sum_where
+        args: {where: {"period": "THIS_YEAR"}, value_path: amount}
+
+    - name: spend_last_12m
+      must: ["spend_words"]
+      call:
+        domain_id: transactions
+        capability: sum_where
+        args: {where: {"period": "LAST_12M"}, value_path: amount}
+
+    - name: refunds_this_year
+      must: ["refund_words", "year"]
+      call:
+        domain_id: transactions
+        capability: sum_where
+        args:
+          where: {"period": "THIS_YEAR", "amountSign": "CREDIT"}
+          value_path: amount
+
+    - name: top_merchants_last_12m
+      must: ["most", "spend_words"]
+      call:
+        domain_id: transactions
+        capability: topk_by_sum
+        args:
+          group_key: merchantName
+          value_path: amount
+          where: {"period": "LAST_12M", "transactionType": "DEBIT"}
+          k: 5
+
+    - name: top_categories_this_year
+      must: ["category_hint", "year"]
+      call:
+        domain_id: transactions
+        capability: topk_by_sum
+        args:
+          group_key: category
+          value_path: amount
+          where: {"period": "THIS_YEAR", "transactionType": "DEBIT"}
+          k: 5
+
+    - name: biggest_purchase_last_month
+      must: ["most", "spend_words", "month"]
+      call:
+        domain_id: transactions
+        capability: list_where
+        args:
+          where: {"period": "LAST_MONTH", "transactionType": "DEBIT"}
+          sort_by: "-amount"
+          limit: 1
+
+    # --------------------------------- LISTING ----------------------------------
+    - name: list_merchant_last_12m
+      must: ["list_words", "merchant_hint"]
+      call:
+        domain_id: transactions
+        capability: list_where
+        args:
+          where: {"period": "LAST_12M", "merchant_like": "${MERCHANT}"}
+          limit: 50
+
+    - name: list_declined_in_ym
+      must: ["list_words", "decline_words"]
+      call:
+        domain_id: transactions
+        capability: list_where
+        args:
+          where: {"period": "${YYYY-MM}", "transactionStatus": "DECLINED"}
+          limit: 50
+
+    - name: list_reversed_this_year
+      must: ["list_words", "reversed_words", "year"]
+      call:
+        domain_id: transactions
+        capability: list_where
+        args:
+          where: {"period": "THIS_YEAR", "displayTransactionType": "REVERSAL"}
+          limit: 50
+
+    - name: list_payments_q3
+      must: ["list_words", "payment_words", "quarter"]
+      call:
+        domain_id: payments
+        capability: list_where
+        args:
+          where: {"period": "${YYYY-Q3}"}
+          limit: 50
+
+    - name: list_purchases_over_threshold_last_month
+      must: ["list_words", "spend_words", "month"]
+      call:
+        domain_id: transactions
+        capability: list_where
+        args:
+          where: {"period": "LAST_MONTH", "min_amount": 200}
+          limit: 50
+
+    # --------------------------- SEMANTIC over transactions ---------------------
+    - name: sem_apple
+      must: ["tx_words"]
+      may:  ["merchant_hint"]
+      call:
+        domain_id: transactions
+        capability: semantic_search
+        args: {query: "Apple", alternates: ["Apple Services", "Apple Pay"], must_include: ["apple"], k: 12}
+
+    - name: sem_travel_this_year
+      must: ["travel_words", "year"]
+      call:
+        domain_id: transactions
+        capability: semantic_search
+        args: {query: "travel purchases", alternates: ["airline", "hotel", "car rental"], k: 12}
+
+    - name: sem_rideshare
+      must: ["rideshare_words"]
+      call:
+        domain_id: transactions
+        capability: semantic_search
+        args: {query: "rideshare", alternates: ["Uber", "Lyft"], k: 12}
+
+    - name: sem_subscriptions
+      must: ["subscription_words"]
+      call:
+        domain_id: transactions
+        capability: semantic_search
+        args: {query: "subscriptions", alternates: ["recurring", "renewal"], k: 12}
+
+    - name: sem_gift_in_notes
+      must: ["tx_words"]
+      call:
+        domain_id: transactions
+        capability: semantic_search
+        args: {query: "gift OR present in memo/notes", k: 12}
+
+    # ------------------------------- STATEMENTS ---------------------------------
+    - name: latest_interest_amount
+      must: ["recency", "interest"]
+      call:
+        domain_id: statements
+        capability: find_latest
+        args: {field: closingDateTime, where: {"interestCharged": {">": 0}}}
+
+    - name: interest_breakdown_latest
+      must: ["interest", "breakdown"]
+      call: {domain_id: statements, capability: interest_breakdown, args: {period: null}}
+
+    - name: trailing_interest_latest
+      must: ["interest", "trailing"]
+      call: {domain_id: statements, capability: trailing_interest, args: {period: null}}
+
+    - name: highest_interest_period
+      must: ["interest", "most"]
+      call:
+        domain_id: statements
+        capability: list_where
+        args:
+          where: {}
+          sort_by: "-interestCharged"
+          limit: 1
+
+    # ------------------------------- PAYMENTS -----------------------------------
+    - name: largest_payment_this_year
+      must: ["most", "payment_words", "year"]
+      call:
+        domain_id: payments
+        capability: list_where
+        args:
+          where: {"period": "THIS_YEAR"}
+          sort_by: "-amount"
+          limit: 1
+
+    - name: returned_failed_payments
+      must: ["returned_payment_words"]
+      call:
+        domain_id: payments
+        capability: list_where
+        args:
+          where: {"status": "RETURNED"}
+          limit: 50
+
+    - name: avg_payment_this_year
+      must: ["payment_words", "average", "year"]
+      call:
+        domain_id: payments
+        capability: sum_where
+        args: {where: {"period": "THIS_YEAR"}, value_path: amount, return_avg: true}
+
+    # ------------------------------ POLICY / HANDBOOK ---------------------------
+    - name: policy_late_fee
+      must: ["policy_words", "late"]
+      strategy: rag:knowledge
+      call: {domain_id: knowledge, capability: handbook_answer, args: {topic: "late fees"}}
+
+    - name: policy_dispute_chargeback
+      must: ["policy_words", "chargeback"]
+      strategy: rag:knowledge
+      call: {domain_id: knowledge, capability: handbook_answer, args: {topic: "dispute / chargeback"}}
+
+    - name: policy_interest_calc
+      must: ["policy_words", "interest"]
+      strategy: rag:knowledge
+      call: {domain_id: knowledge, capability: handbook_answer, args: {topic: "interest calculation"}}
+
+    - name: policy_miss_payment
+      must: ["policy_words", "miss", "payment"]
+      strategy: rag:knowledge
+      call: {domain_id: knowledge, capability: handbook_answer, args: {topic: "missed payment"}}
+
+    - name: policy_cash_advance
+      must: ["policy_words", "cash", "advance"]
+      strategy: rag:knowledge
+      call: {domain_id: knowledge, capability: handbook_answer, args: {topic: "cash advance interest and fees"}}
+
+    # ------------------------------ UNIFIED RAG ---------------------------------
+    - name: why_interest_last_month
+      must: ["why", "interest", "month"]
+      strategy: rag:unified
+      call: {domain_id: rag, capability: unified_answer, args: {focus: "interest"}}
+
+    - name: trailing_interest_next_cycle
+      must: ["interest", "trailing", "next"]
+      strategy: rag:unified
+      call: {domain_id: rag, capability: unified_answer, args: {focus: "trailing interest"}}
+
+    - name: annual_fee_policy_check
+      must: ["annual", "fee"]
+      strategy: rag:unified
+      call: {domain_id: rag, capability: unified_answer, args: {focus: "annual fee"}}
+
+    - name: foreign_txn_fees
+      must: ["foreign", "transaction", "fee"]
+      strategy: rag:unified
+      call: {domain_id: rag, capability: unified_answer, args: {focus: "foreign transactions"}}
+
+    - name: return_interest_expectation
+      must: ["return", "interest"]
+      strategy: rag:unified
+      call: {domain_id: rag, capability: unified_answer, args: {focus: "returns & interest"}}
+
+    # ------------------------------ COMPARISONS ---------------------------------
+    - name: compare_last_two_months
+      must: ["compare", "spend_words", "month"]
+      call: {domain_id: transactions, capability: compare_periods, args: {period1: "LAST_MONTH", period2: "PREV_MONTH"}}
+
+    - name: compare_q2_q3
+      must: ["compare", "q2", "q3"]
+      call: {domain_id: transactions, capability: compare_periods, args: {period1: "${YYYY-Q2}", period2: "${YYYY-Q3}"}}
+
+    - name: merchant_totals_month
+      must: ["merchant", "totals"]
+      call:
+        domain_id: transactions
+        capability: topk_by_sum
+        args:
+          group_key: merchantName
+          value_path: amount
+          where: {"period": "${YYYY-MM}"}
+          k: 100
+
+    # ------------------------------ MULTI-TURN / MEMORY -------------------------
+    # Planner doesn’t need special rules here; the runtime memory filters last results.
+    # Keep the generic routes above; memory layer narrows list/sum on follow-ups.
+
+    # ------------------------------ AMBIGUITY -----------------------------------
+    - name: ambiguous_spend_default_last12m
+      must: ["spend_words"]
+      call: {domain_id: transactions, capability: sum_where, args: {where: {"period": "LAST_12M"}, value_path: amount}}
+
+    - name: ambiguous_largest_purchase_default_ytd
+      must: ["most", "spend_words"]
+      call:
+        domain_id: transactions
+        capability: list_where
+        args:
+          where: {"period": "THIS_YEAR"}
+          sort_by: "-amount"
+          limit: 1
+
+    - name: any_fees
+      must: ["fee"]
+      call:
+        domain_id: transactions
+        capability: list_where
+        args:
+          where: {"category_like": "FEE"}
+          limit: 50
+
+    - name: abbrev_merchant
+      must: ["tx_words"]
+      call:
+        domain_id: transactions
+        capability: semantic_search
+        args: {query: "${MERCHANT_ABBREV}", k: 12}
+
+    # ------------------------------ EDGE CASES ----------------------------------
+    - name: none_over_5000_last_month
+      must: ["spend_words", "month"]
+      call:
+        domain_id: transactions
+        capability: list_where
+        args:
+          where: {"period": "LAST_MONTH", "min_amount": 5000}
+          limit: 50
+
+    - name: reversed_in_ym
+      must: ["reversed_words"]
+      call:
+        domain_id: transactions
+        capability: list_where
+        args: {where: {"period": "${YYYY-MM}", "displayTransactionType": "REVERSAL"}, limit: 50}
+
+    - name: account_owner
+      must: ["account", "owner", "name"]
+      call:
+        domain_id: account_summary
+        capability: get_field
+        args: {field: "persons[0].personName"}
+
+    - name: pending_vs_posted_counts_last_month
+      must: ["pending", "posted", "counts", "month"]
+      call:
+        domain_id: transactions
+        capability: list_where
+        args:
+          where: {"period": "LAST_MONTH"}
+          aggregate: {"posted": {"transactionStatus": "POSTED"}, "pending": {"transactionStatus": "PENDING"}}
+
+    - name: utilization
+      must: ["utilization"]
+      call:
+        domain_id: account_summary
+        capability: get_field
+        args: {field: "__compute__(currentBalance/creditLimit)"}
+
+    # ------------------------------ CROSS-ACCOUNT -------------------------------
+    - name: cross_acc_balance
+      must: ["balance"]
+      call:
+        domain_id: account_summary
+        capability: get_field
+        args: {field: currentBalance, account_id: "${ACCOUNT_ID}"}
+
+    - name: cross_acc_top_merchants
+      must: ["most", "merchant", "year"]
+      call:
+        domain_id: transactions
+        capability: topk_by_sum
+        args:
+          account_id: "${ACCOUNT_ID}"
+          group_key: merchantName
+          value_path: amount
+          where: {"period": "THIS_YEAR", "transactionType": "DEBIT"}
+          k: 5
+
+    - name: compare_interest_two_accounts_q
+      must: ["compare", "interest", "quarter"]
+      call:
+        domain_id: statements
+        capability: list_where
+        args:
+          where: {"period": "${YYYY-Q*}"}   # planner will fill two accounts / periods in code path
+          aggregate: {"sum": "interestCharged"}
+          compare_across_accounts: true
+
+    # ------------------------------ STRESS / LONG CONTEXT -----------------------
+    - name: summarize_spend_last12m
+      must: ["summarize", "spend_words"]
+      strategy: rag:unified
+      call: {domain_id: rag, capability: unified_answer, args: {focus: "spending trends last 12 months"}}
+
+    - name: budget_insight_next_month
+      must: ["budget", "save"]
+      strategy: rag:unified
+      call: {domain_id: rag, capability: unified_answer, args: {focus: "budget insight"}}
+
+    - name: interest_reasons_with_sources
+      must: ["reasons", "interest"]
+      strategy: rag:unified
+      call: {domain_id: rag, capability: unified_answer, args: {focus: "interest reasons with sources"}}
