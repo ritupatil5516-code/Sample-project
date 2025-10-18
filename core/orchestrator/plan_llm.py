@@ -176,51 +176,62 @@ def build_chat_messages(ctx: Dict[str, Any], core_pack: Dict[str, Any], question
 
 # --------------------------------- public API -------------------------------- #
 
-def llm_plan(question: str) -> Dict[str, Any]:
-    """
-    1) Read core pack (system+glossary+reasoning+planner_contract+planner_rules).
-    2) Try deterministic plan from planner_rules.
-    3) If no match, call the LLM planner (still guided by the same core pack).
-    """
-    cfg = _read_app_cfg()
-    core_pack = _read_core_pack()
-    rules = _extract_planner_rules(core_pack)
+from langchain.schema import SystemMessage, HumanMessage, AIMessage
+from src.core.runtime import RUNTIME
 
-    # Try rules first
-    rule_plan = try_plan_from_rules(question, rules)
-    if rule_plan:
-        return rule_plan
+def _to_lc_messages(msgs: list[dict]) -> list:
+    out = []
+    for m in msgs:
+        role = (m.get("role") or "").lower()
+        content = m.get("content") or ""
+        if role == "system":
+            out.append(SystemMessage(content=content))
+        elif role == "user":
+            out.append(HumanMessage(content=content))
+        else:
+            out.append(AIMessage(content=content))
+    return out
 
-    # Fall back to LLM (with packs)
-    llm = build_llm_from_config(cfg)
-    ctx = build_context(intent="planner", question=question, plan=None)
-    hint = build_hint_for_question(question)
-    messages = build_chat_messages(ctx, core_pack, question, rules, hint)
+def _extract_json_block(text: str) -> str:
+    s = str(text or "")
+    # strip code fences if present
+    if "```" in s:
+        s = s.split("```", 1)[-1]
+        if "```" in s:
+            s = s.split("```", 1)[0]
+    start = s.find("{"); end = s.rfind("}")
+    return s[start:end+1] if (start >= 0 and end > start) else s
 
-    raw = llm.complete(messages, model=(cfg.get("llm") or {}).get("model"), temperature=0.0)
-    s, e = raw.find("{"), raw.rfind("}")
-    if s >= 0 and e > s:
-        raw = raw[s:e + 1]
+def llm_plan(question: str) -> dict:
+    # ... build context/hint and your `messages` (list of dicts: {role, content}) ...
+    ctx   = build_context(intent="planner", question=question, plan=None)
+    hint  = build_hint_for_question(question)
+    messages = build_chat_messages(ctx, core_pack=_read_pack(), question=question, rules=_extract_planner_rules(_read_pack()), hint=hint)
 
+    # LangChain call (IMPORTANT: use .content)
+    chat = RUNTIME.chat()  # returns langchain_openai.ChatOpenAI
+    lc_messages = _to_lc_messages(messages)
+    ai_msg = chat.invoke(lc_messages)            # AIMessage
+    raw_text = getattr(ai_msg, "content", str(ai_msg))  # <-- string for parsing
+
+    # Parse JSON result
     try:
-        obj = json.loads(raw)
+        json_block = _extract_json_block(raw_text)
+        obj = json.loads(json_block)
     except Exception:
-        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": [], "strategy": "llm"}
+        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": []}
 
+    # normalize
     if not isinstance(obj, dict):
-        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": [], "strategy": "llm"}
-
-    safe_calls: List[Dict[str, Any]] = []
-    for c in obj.get("calls") or []:
-        if isinstance(c, dict):
-            safe_calls.append({
-                "domain_id": c.get("domain_id", ""),
-                "capability": c.get("capability", ""),
-                "args": c.get("args", {}) if isinstance(c.get("args"), dict) else {}
-            })
-    obj["calls"] = safe_calls
+        return {"intent": "unknown", "calls": [], "must_produce": [], "risk_if_missing": []}
     obj.setdefault("intent", "unknown")
-    obj.setdefault("must_produce", [])
-    obj.setdefault("risk_if_missing", [])
-    obj.setdefault("strategy", "llm")
+    calls = obj.get("calls") or []
+    safe = []
+    for c in calls:
+        if isinstance(c, dict):
+            c.setdefault("domain_id", ""); c.setdefault("capability", ""); c.setdefault("args", {})
+            if not isinstance(c["args"], dict): c["args"] = {}
+            safe.append(c)
+    obj["calls"] = safe
+    obj.setdefault("must_produce", []); obj.setdefault("risk_if_missing", [])
     return obj
