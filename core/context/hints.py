@@ -1,41 +1,56 @@
-# this is like how to think
+# core/context/hints.py
 from __future__ import annotations
-from typing import Dict
+from typing import Dict, Optional
+from pathlib import Path
+import yaml
 
-def build_hint_for_question(q: str) -> Dict[str, str]:
+PACK_PATH = Path("core/context/packs/core.yaml")
+
+def _load_synonyms() -> Dict[str, list]:
+    try:
+        pack = yaml.safe_load(PACK_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        pack = {}
+    pr = (pack.get("planner_rules") or {}) if isinstance(pack, dict) else {}
+    syn = pr.get("synonyms") or {}
+    # normalize to sets of lower strings
+    return {k: [str(x).lower() for x in (v or [])] for k, v in syn.items()}
+
+def _has_any(text: str, keys: list) -> bool:
+    return any(k in text for k in (keys or []))
+
+def build_hint_for_question(q: str) -> Optional[Dict[str, str]]:
     """
-    Lightweight, rule-of-thumb hints the planner can use to disambiguate.
-    Returns a dict with a short 'content' string you can inject as a system msg.
-    Safe to no-op if nothing matches.
+    Hints derived from planner_rules.synonyms (if present) so they stay in sync with core.yaml.
+    Falls back to light heuristics if synonyms are missing.
     """
-    ql = (q or "").strip().lower()
+    ql = (q or "").lower()
+    syn = _load_synonyms()
+
     hints = []
 
-    # “last / latest / recent” nudges:
-    if any(w in ql for w in ("last ", "latest", "recent")) and "transaction" in ql:
-        hints.append("Interpret 'last transaction' as the record with the maximum transactionDateTime.")
+    # Recency routing (map to correct timestamp by domain)
+    recency_words = syn.get("recency", ["last", "latest", "recent", "most recent", "recently"])
+    tx_words      = syn.get("tx_words", ["transaction", "transactions", "purchase", "purchases", "charge", "charges"])
+    pay_words     = syn.get("payment_words", ["payment", "paid", "pay", "remit"])
+    stmt_words    = syn.get("stmt_words", ["statement", "cycle", "period", "closing"])
+    interest_words= syn.get("interest", ["interest", "finance charge", "trailing interest"])
 
-    if any(w in ql for w in ("last ", "latest", "recent")) and "interest" in ql:
-        hints.append("When user asks for last/latest interest, pick the most recent statement with non-zero interestCharged; if none, use most recent period.")
+    if _has_any(ql, recency_words) and _has_any(ql, tx_words):
+        hints.append("For recency over transactions, use the maximum postedDateTime.")
+    if _has_any(ql, recency_words) and _has_any(ql, pay_words):
+        hints.append("For recency over payments, use the maximum paymentPostedDateTime.")
+    if _has_any(ql, recency_words) and _has_any(ql, stmt_words):
+        hints.append("For recency over statements, use the maximum closingDateTime.")
 
-    # Average monthly spend:
-    if "average" in ql and ("month" in ql or "monthly" in ql) and ("spend" in ql or "purchase" in ql):
-        hints.append("Average monthly spend = mean of monthly totals grouped by YYYY-MM over available transactions.")
+    # Interest guidance
+    if _has_any(ql, interest_words):
+        hints.append("Interest amounts are in statements.interestCharged; prefer the latest statement with interestCharged > 0, otherwise the latest period.")
 
-    # Compare months:
-    if "compare" in ql and "spend" in ql:
-        hints.append("To compare months, compute total spend per YYYY-MM and present a side-by-side delta.")
+    # Balance/credit nudges
+    if "available credit" in ql or "utilization" in ql or "current balance" in ql:
+        hints.append("Use account summary for currentBalance, availableCredit, and derived utilization.")
 
-    # Available credit / current balance:
-    if "available credit" in ql or "current balance" in ql:
-        hints.append("Use account_summary.json for current_balance and available_credit; do not invent numbers.")
-
-    # Payments:
-    if "last payment" in ql or ("when" in ql and "payment" in ql):
-        hints.append("Last payment = payment with maximum paymentDateTime or paymentPostedDateTime.")
-
-    # Fallback if nothing triggered:
     if not hints:
-        return {"role": "system", "content": "No special hint."}
-
+        return None
     return {"role": "system", "content": "Hints:\n- " + "\n- ".join(hints)}

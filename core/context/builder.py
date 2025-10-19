@@ -1,50 +1,20 @@
 # core/context/builder.py
 from __future__ import annotations
-
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import yaml
 
+PACK_PATH = Path("core/context/packs/core.yaml")
 
-"""
-builder.py
-----------
-Builds prompt context for the LLM from ONE unified pack:
-  core/context/packs/core.yaml
-
-Expected sections inside core.yaml (all optional):
-  system: str                     # main system instruction
-  glossary: list[str] | dict      # key terms
-  reasoning: list[str] | dict     # nudges like "last txn = max(timestamp)"
-  planner_contract: str | dict    # how to emit the plan JSON
-  domains: list[str] | dict       # visible domains (informational)
-  extras: list[str] | dict        # any additional notes you want included
-
-Usage:
-  ctx = build_context(intent="planner", question=..., plan=None)
-  messages = [
-      {"role":"system","content": ctx["system"]},
-      *ctx["context_msgs"],
-      # then your specific planner SYSTEM_CONTRACT + the user message...
-  ]
-"""
-
-
-# ------------------------------- helpers --------------------------------------
-
-def _safe_yaml_load(path: Path) -> Dict[str, Any]:
+def _load_yaml(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        with path.open("r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
-        # malformed YAML → ignore gracefully
         return {}
 
-
 def _as_block(value: Any) -> str:
-    """Normalize lists/dicts/strings into a readable block."""
     if value is None:
         return ""
     if isinstance(value, list):
@@ -60,15 +30,11 @@ def _as_block(value: Any) -> str:
         return "\n".join(lines)
     return str(value)
 
-
 def _section_msg(title: str, content: Any) -> Dict[str, str]:
     body = _as_block(content).strip()
     if not body:
         return {}
     return {"role": "system", "content": f"{title}:\n{body}"}
-
-
-# ------------------------------- main API -------------------------------------
 
 def build_context(
     intent: str,
@@ -78,51 +44,70 @@ def build_context(
     pack_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Build context messages for the given intent.
-    - intent: "planner" | "answer" | anything else (used only to decide which sections to include)
-    - question/plan: not embedded here; caller adds the user message and any plan trace
-    - pack_path: override path to the single pack (default core/context/packs/core.yaml)
-
-    Returns:
-      {
-        "system": str,                 # main system string (may be empty)
-        "context_msgs": List[Msg],     # system messages for glossary/reasoning/contract/etc.
-      }
+    Works with two shapes of core.yaml:
+      1) Full pack with top-level: system/glossary/reasoning/planner_contract/domains/extras
+      2) Your current pack with only: planner_rules: {synonyms, defaults, routes}
     """
-    pack_file = Path(pack_path or "core/context/packs/core.yaml")
-    pack = _safe_yaml_load(pack_file)
-
-    # Extract canonical sections (all optional)
-    system_text        = pack.get("system", "") or ""
-    glossary_section   = pack.get("glossary")
-    reasoning_section  = pack.get("reasoning")
-    contract_section   = pack.get("planner_contract")
-    domains_section    = pack.get("domains")
-    extras_section     = pack.get("extras")
+    pack_file = Path(pack_path or PACK_PATH)
+    pack = _load_yaml(pack_file)
 
     msgs: List[Dict[str, str]] = []
 
-    # Order matters: glossary → reasoning → (planner contract for planner intent) → domains → extras
-    if glossary_section:
-        msg = _section_msg("Glossary", glossary_section)
-        if msg: msgs.append(msg)
+    # ----- Preferred: use top-level content if present
+    system_text  = (pack.get("system") or "") if isinstance(pack, dict) else ""
+    glossary     = pack.get("glossary")
+    reasoning    = pack.get("reasoning")
+    contract     = pack.get("planner_contract")
+    domains      = pack.get("domains")
+    extras       = pack.get("extras")
 
-    if reasoning_section:
-        msg = _section_msg("Reasoning", reasoning_section)
-        if msg: msgs.append(msg)
+    if glossary:  msgs.append(_section_msg("Glossary", glossary))
+    if reasoning: msgs.append(_section_msg("Reasoning", reasoning))
+    if intent == "planner" and contract:
+        msgs.append(_section_msg("Planner Contract", contract))
+    if domains:   msgs.append(_section_msg("Domains", domains))
+    if extras:    msgs.append(_section_msg("Notes", extras))
 
-    # Only include planner contract when composing the planning prompt
-    if intent == "planner" and contract_section:
-        msg = _section_msg("Planner Contract", contract_section)
-        if msg: msgs.append(msg)
+    # ----- Fallback: derive useful context from planner_rules when top-level is missing
+    pr = (pack.get("planner_rules") or {}) if isinstance(pack, dict) else {}
+    if not system_text:
+        system_text = (
+            "You are the planner for a Smart Finance Copilot.\n"
+            "Decide a single call over domains: transactions, payments, statements, accounts.\n"
+            "Prefer deterministic operations (get_field, find_latest, sum_where, topk_by_sum, list_where).\n"
+            "If the question asks WHY/EXPLAIN or mentions policy/handbook/fees/interest policy, set strategy=rag:unified."
+        )
 
-    if domains_section:
-        msg = _section_msg("Domains", domains_section)
-        if msg: msgs.append(msg)
+    syn = pr.get("synonyms") or {}
+    if syn:
+        msgs.append(_section_msg("Synonyms (routing hints)", syn))
 
-    if extras_section:
-        msg = _section_msg("Notes", extras_section)
-        if msg: msgs.append(msg)
+    defaults = pr.get("defaults") or {}
+    if defaults:
+        msgs.append(_section_msg("Default time interpretations", defaults))
+
+    # Provide a compact contract if none existed
+    if intent == "planner" and not contract:
+        minimal_contract = (
+            "Return ONLY a JSON object of the form:\n"
+            "{\n"
+            '  \"intent\": \"string\",\n'
+            '  \"calls\": [\n'
+            '    {\"domain_id\":\"transactions|payments|statements|accounts\",'
+            '     \"capability\":\"get_field|find_latest|sum_where|topk_by_sum|list_where|semantic_search|compare_periods\",'
+            '     \"args\": {...}, \"strategy\":\"deterministic|rag:unified|rag:knowledge|auto\"}\n'
+            '  ],\n'
+            '  \"must_produce\": [],\n'
+            '  \"risk_if_missing\": [],\n'
+            '  \"strategy\": \"deterministic|rag:unified|rag:knowledge|auto\"\n'
+            "}\n"
+            "- Domains allowed: transactions, payments, statements, accounts.\n"
+            "- Use statements.closingDateTime / transactions.postedDateTime / payments.paymentPostedDateTime for recency."
+        )
+        msgs.append({"role": "system", "content": minimal_contract})
+
+    # clean blanks
+    msgs = [m for m in msgs if m]
 
     return {
         "system": system_text.strip(),
