@@ -1,182 +1,331 @@
-# index_builder.py
+# core/retrieval/index_builder.py
 from __future__ import annotations
-import json, os
-from pathlib import Path
-from typing import Iterable, List, Dict, Any, Optional
 
-import faiss
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
+# ---- LlamaIndex / FAISS ----
 from llama_index.core import (
     Document,
+    Settings,
     StorageContext,
     VectorStoreIndex,
     load_index_from_storage,
 )
-from llama_index.core.node_parser import SentenceSplitter
 from llama_index.vector_stores.faiss import FaissVectorStore
 
-# ---------- Paths (adjust if yours differ) ----------
-ROOT = Path(__file__).resolve().parents[3]   # .../src/api/contextApp
-DATA_DIR = ROOT / "customer_data"
-KNOWLEDGE_DIR = ROOT / "data" / "knowledge"
-INDEX_ROOT = ROOT / "indexesstore"           # persist here
+# Simple file reader that supports .md/.txt/.pdf (via pypdf)
+from llama_index.core import SimpleDirectoryReader
 
-# ---------- Embedding dim helper ----------
-def _embed_dim(model: str | None = None) -> int:
-    """
-    Keep in sync with the embedding model you set in Settings.
-    OpenAI text-embedding-3-large -> 3072, small -> 1536.
-    """
-    return 3072
+# Local embedding as a sensible default (no OpenAI key required)
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-# ---------- JSON helpers ----------
-def _read_json(p: Path) -> Any:
-    with p.open("r", encoding="utf-8") as f:
+try:
+    import faiss  # type: ignore
+except Exception as e:  # pragma: no cover
+    raise RuntimeError(
+        "faiss is required. pip install faiss-cpu (or faiss-gpu) for your platform."
+    ) from e
+
+
+# ======================================================================================
+# Defaults — change these to match your project structure
+# ======================================================================================
+
+# Where JSON lives
+ACCOUNTS_DATA_DIR = Path("src/api/contextApp/customer_data")
+
+# Knowledge files (md/pdf/txt)
+KNOWLEDGE_DATA_DIR = Path("src/api/contextApp/data/knowledge")
+
+# Where FAISS indices are persisted
+INDEX_STORE_DIR = Path("src/api/contextApp/indexesstore")
+
+# Subpaths for account / knowledge indices
+ACCOUNTS_INDEX_DIR = INDEX_STORE_DIR / "accounts"
+KNOWLEDGE_INDEX_DIR = INDEX_STORE_DIR / "knowledge" / "llama"
+
+
+# ======================================================================================
+# Utilities
+# ======================================================================================
+
+@dataclass
+class BuildResult:
+    count: int
+    persist_dir: str
+    dim: int
+
+
+def _ensure_embed_model_if_missing() -> None:
+    """
+    Ensure LlamaIndex has an embedding model set.
+    We default to a local HF model to avoid OpenAI dependency.
+    """
+    if Settings.embed_model is None:
+        Settings.embed_model = HuggingFaceEmbedding(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+
+
+def _embedding_dim() -> int:
+    """Probe the configured embedding model to determine vector dimension."""
+    _ensure_embed_model_if_missing()
+    model = Settings.embed_model
+    for attr in ("get_text_embedding", "get_query_embedding", "embed", "embed_query"):
+        fn = getattr(model, attr, None)
+        if callable(fn):
+            vec = fn("dimension probe")
+            return len(vec)
+    # Fallback: try attribute
+    dim = getattr(model, "dimension", None)
+    if isinstance(dim, int) and dim > 0:
+        return dim
+    raise RuntimeError("Could not determine embedding dimension from the embed model.")
+
+
+def _mk_storage_with_faiss(persist_dir: Path) -> Tuple[StorageContext, FaissVectorStore]:
+    """Create a FAISS vector store + storage context for a given persist directory."""
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    dim = _embedding_dim()
+    faiss_index = faiss.IndexFlatIP(dim)  # cosine w/ normalized vectors; or L2 via IndexFlatL2
+    vector_store = FaissVectorStore(faiss_index=faiss_index)
+    storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(persist_dir))
+    return storage, vector_store
+
+
+def _iter_files(root: Union[str, Path], exts: Sequence[str]) -> List[Path]:
+    p = Path(root)
+    if not p.exists():
+        return []
+    out: List[Path] = []
+    for ext in exts:
+        out.extend(p.rglob(f"*{ext}"))
+    return out
+
+
+def _read_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
-def _iter_account_docs(account_id: str) -> List[Document]:
+
+def _yyyy_mm_from_iso(dt: Optional[str]) -> Optional[str]:
+    if not dt or not isinstance(dt, str):
+        return None
+    # Expecting 2024-09-01T... or 2024-09-01
+    try:
+        return dt[:7]
+    except Exception:
+        return None
+
+
+# ======================================================================================
+# Knowledge indexing
+# ======================================================================================
+
+def ensure_knowledge_index(
+    knowledge_dir: Union[str, Path] = KNOWLEDGE_DATA_DIR,
+    persist_dir: Union[str, Path] = KNOWLEDGE_INDEX_DIR,
+    files: Optional[Union[Path, str, Iterable[Union[Path, str]]]] = None,
+) -> BuildResult:
     """
-    Flatten the 4 account JSONs into LlamaIndex Documents.
-    One Document per row (transactions/payments/statements)
-    and one Document for account_summary.
+    Build (or rebuild) the knowledge FAISS index.
+
+    - knowledge_dir: folder that contains .md/.pdf/.txt
+    - files: optional list/iterable of explicit file paths; also accepts a single Path/str
+             (we normalize single values → [value] to avoid `WindowsPath not iterable`)
+    - persist_dir: location for FAISS + index/docstore json
+
+    Returns: BuildResult(count=#docs, persist_dir, dim)
     """
-    base = DATA_DIR / account_id
-    tx = base / "transactions.json"
-    py = base / "payments.json"
-    st = base / "statements.json"
-    ac = base / "account_summary.json"
+    persist_dir = Path(persist_dir)
+    knowledge_dir = Path(knowledge_dir)
 
-    docs: List[Document] = []
-    splitter = SentenceSplitter(chunk_size=800, chunk_overlap=100)
+    # Resolve file set
+    if files is None:
+        file_paths = _iter_files(knowledge_dir, exts=[".md", ".pdf", ".txt"])
+    else:
+        # normalize to list of Paths
+        if isinstance(files, (str, Path)):
+            file_paths = [Path(files)]
+        else:
+            file_paths = [Path(x) for x in files]
 
-    def _docify(row: Dict[str, Any], domain: str) -> List[Document]:
-        text = json.dumps(row, ensure_ascii=False)
-        # let LlamaIndex chunk it to keep similarity higher granularity
-        nodes = splitter.get_nodes_from_documents([Document(text=text)])
-        out: List[Document] = []
-        for nd in nodes:
-            out.append(
-                Document(
-                    text=nd.get_content(),
-                    metadata={
-                        "account_id": account_id,
-                        "domain": domain,
-                        # common shortcuts that help in retrieval filters/snippets
-                        "merchantName": row.get("merchantName"),
-                        "description": row.get("description"),
-                        "amount": row.get("amount"),
-                        "postedDateTime": row.get("postedDateTime"),
-                        "transactionDateTime": row.get("transactionDateTime"),
-                        "paymentPostedDateTime": row.get("paymentPostedDateTime"),
-                        "period": row.get("period"),
-                    },
-                )
-            )
-        return out
+    if not file_paths:
+        return BuildResult(count=0, persist_dir=str(persist_dir), dim=_embedding_dim())
 
-    if tx.exists():
-        for r in _read_json(tx) or []:
-            docs.extend(_docify(r, "transactions"))
+    # Load documents
+    reader = SimpleDirectoryReader(input_files=[str(p) for p in file_paths])
+    docs = reader.load_data()
 
-    if py.exists():
-        for r in _read_json(py) or []:
-            docs.extend(_docify(r, "payments"))
+    # Build FAISS vector store and persist
+    storage, _ = _mk_storage_with_faiss(persist_dir)
+    index = VectorStoreIndex.from_documents(docs, storage_context=storage, show_progress=True)
+    storage.persist()
 
-    if st.exists():
-        for r in _read_json(st) or []:
-            docs.extend(_docify(r, "statements"))
+    return BuildResult(count=len(docs), persist_dir=str(persist_dir), dim=_embedding_dim())
 
-    if ac.exists():
-        row = _read_json(ac) or {}
-        # keep one document for summary (also chunked)
-        docs.extend(_docify(row, "account_summary"))
 
-    return docs
+# ======================================================================================
+# Account indexing (transactions/payments/statements/account_summary)
+# ======================================================================================
+
+def _account_paths(account_id: str, base_dir: Union[str, Path]) -> Dict[str, Path]:
+    """Return expected JSON file paths for an account."""
+    root = Path(base_dir) / account_id
+    return {
+        "transactions": root / "transactions.json",
+        "payments": root / "payments.json",
+        "statements": root / "statements.json",
+        "account_summary": root / "account_summary.json",
+    }
+
+
+def _rows_from_json(obj: Any) -> List[Dict[str, Any]]:
+    if obj is None:
+        return []
+    if isinstance(obj, list):
+        return list(obj)
+    if isinstance(obj, dict):
+        # either dict with "items" or a single object; normalize to one row
+        if "items" in obj and isinstance(obj["items"], list):
+            return list(obj["items"])
+        return [obj]
+    return []
+
 
 def build_account_index(
     account_id: str,
-    base_dir: Path | None = None,
-    persist_dir: Path | None = None,
-) -> Dict[str, Any]:
+    base_dir: Union[str, Path] = ACCOUNTS_DATA_DIR,
+    persist_dir: Optional[Union[str, Path]] = None,
+) -> BuildResult:
     """
-    Build FAISS index for a single account (all 4 JSONs together).
+    Build an account-specific FAISS index from JSON domain files.
+    Documents are the raw JSON rows per domain with helpful metadata.
     """
-    base_dir = base_dir or (DATA_DIR / account_id)
-    persist_dir = persist_dir or (INDEX_ROOT / "accounts" / account_id / "llama")
+    if persist_dir is None:
+        persist_dir = ACCOUNTS_INDEX_DIR / account_id / "llama"
+    persist_dir = Path(persist_dir)
     persist_dir.mkdir(parents=True, exist_ok=True)
 
-    docs = _iter_account_docs(account_id)
+    paths = _account_paths(account_id, base_dir)
+    tx_p = paths["transactions"]
+    pay_p = paths["payments"]
+    stm_p = paths["statements"]
+    sum_p = paths["account_summary"]
+
+    docs: List[Document] = []
+
+    def add_docs(rows: List[Dict[str, Any]], domain: str) -> None:
+        for r in rows:
+            # enrich metadata for common filters
+            md: Dict[str, Any] = {
+                "account_id": account_id,
+                "domain": domain,
+                "merchantName": r.get("merchantName"),
+                "transactionType": r.get("transactionType") or r.get("displayTransactionType"),
+                "amount": r.get("amount"),
+                "period": (
+                    r.get("period")
+                    or _yyyy_mm_from_iso(r.get("postedDateTime"))
+                    or _yyyy_mm_from_iso(r.get("transactionDateTime"))
+                    or _yyyy_mm_from_iso(r.get("closingDateTime"))
+                ),
+                "postedDateTime": r.get("postedDateTime"),
+                "transactionDateTime": r.get("transactionDateTime"),
+                "closingDateTime": r.get("closingDateTime"),
+            }
+            docs.append(
+                Document(text=json.dumps(r, ensure_ascii=False), metadata=md)
+            )
+
+    # transactions
+    if tx_p.exists():
+        add_docs(_rows_from_json(_read_json(tx_p)), "transactions")
+
+    # payments
+    if pay_p.exists():
+        add_docs(_rows_from_json(_read_json(pay_p)), "payments")
+
+    # statements
+    if stm_p.exists():
+        add_docs(_rows_from_json(_read_json(stm_p)), "statements")
+
+    # account_summary (usually just one row)
+    if sum_p.exists():
+        add_docs(_rows_from_json(_read_json(sum_p)), "account_summary")
+
     if not docs:
-        return {"count": 0, "persist_dir": str(persist_dir), "dim": _embed_dim()}
+        return BuildResult(count=0, persist_dir=str(persist_dir), dim=_embedding_dim())
 
-    dim = _embed_dim()
-    faiss_index = faiss.IndexFlatIP(dim)                 # cosine via inner-product
-    vector_store = FaissVectorStore(faiss_index=faiss_index)
-    storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(persist_dir))
+    storage, _ = _mk_storage_with_faiss(persist_dir)
     VectorStoreIndex.from_documents(docs, storage_context=storage, show_progress=True)
-    storage.persist(persist_dir=str(persist_dir))
-    return {"count": len(docs), "persist_dir": str(persist_dir), "dim": dim}
+    storage.persist()
 
-def ensure_knowledge_index(
-    knowledge_dir: Path | None = None,
-    persist_dir: Path | None = None,
-    files: Optional[List[Path]] = None,
+    return BuildResult(count=len(docs), persist_dir=str(persist_dir), dim=_embedding_dim())
+
+
+# ======================================================================================
+# Convenience: build all
+# ======================================================================================
+
+def build_all(
+    account_id: Optional[str] = None,
+    accounts_base_dir: Union[str, Path] = ACCOUNTS_DATA_DIR,
+    knowledge_dir: Union[str, Path] = KNOWLEDGE_DATA_DIR,
 ) -> Dict[str, Any]:
     """
-    Build FAISS index over handbook + agreement (or provided files list).
+    Build knowledge index and (optionally) the account index.
+    Returns a small summary dict.
     """
-    from llama_index.core import SimpleDirectoryReader  # import here to keep deps light
+    # ensure an embedder exists for both builds
+    _ensure_embed_model_if_missing()
 
-    knowledge_dir = knowledge_dir or KNOWLEDGE_DIR
-    persist_dir = persist_dir or (INDEX_ROOT / "knowledge" / "llama")
-    persist_dir.mkdir(parents=True, exist_ok=True)
+    out: Dict[str, Any] = {"index_root": str(INDEX_STORE_DIR)}
 
-    if files is None:
-        # default two files
-        files = [
-            knowledge_dir / "handbook.md",
-            knowledge_dir / "Apple-Card-Customer-Agreement.pdf",
-        ]
+    # Knowledge
+    try:
+        kr = ensure_knowledge_index(knowledge_dir=knowledge_dir, persist_dir=KNOWLEDGE_INDEX_DIR)
+        out["knowledge"] = {"count": kr.count, "persist_dir": kr.persist_dir, "dim": kr.dim}
+    except Exception as e:
+        out["knowledge"] = {"error": f"{type(e).__name__}: {e}"}
 
-    input_files = [str(p) for p in files if Path(p).exists()]
-    if not input_files:
-        return {"count": 0, "persist_dir": str(persist_dir), "dim": _embed_dim()}
+    # Account (if requested)
+    if account_id:
+        try:
+            ar = build_account_index(account_id=account_id, base_dir=accounts_base_dir)
+            out["account"] = {"count": ar.count, "persist_dir": ar.persist_dir, "dim": ar.dim}
+        except Exception as e:
+            out["account"] = {"error": f"{type(e).__name__}: {e}"}
 
-    reader = SimpleDirectoryReader(input_files=input_files)
-    docs = reader.load_data()
-
-    dim = _embed_dim()
-    faiss_index = faiss.IndexFlatIP(dim)
-    vector_store = FaissVectorStore(faiss_index=faiss_index)
-    storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(persist_dir))
-    VectorStoreIndex.from_documents(docs, storage_context=storage, show_progress=True)
-    storage.persist(persist_dir=str(persist_dir))
-    return {"count": len(docs), "persist_dir": str(persist_dir), "dim": dim}
-
-# ---------- loaders used by RAG ----------
-def load_account_index(persist_dir: str | Path):
-    p = Path(persist_dir)
-    vector_store = FaissVectorStore.from_persist_dir(str(p))
-    storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(p))
-    return load_index_from_storage(storage)
-
-def load_knowledge_index(persist_dir: str | Path):
-    p = Path(persist_dir)
-    vector_store = FaissVectorStore.from_persist_dir(str(p))
-    storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(p))
-    return load_index_from_storage(storage)
-
-# ---------- convenience: build all ----------
-def ensure_all_indexes(account_ids: Iterable[str]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"knowledge": ensure_knowledge_index()}
-    for aid in account_ids:
-        out[aid] = build_account_index(aid)
     return out
 
+
+# ======================================================================================
+# CLI
+# ======================================================================================
+
 if __name__ == "__main__":
-    # Example: build everything on startup for a known account
-    # (adjust account id or pass a list)
-    aid = "3b1ba69f-8c69-4e7c-94e2-2e60e223617a"
-    print("[BOOT] Building indexes…")
-    print("Knowledge:", ensure_knowledge_index())
-    print("Account:", build_account_index(aid))
+    """
+    Example usage:
+      python -m core.retrieval.index_builder                      # knowledge only
+      python -m core.retrieval.index_builder 3b1ba69f-...-3617a   # also build account index
+    """
+    import sys
+
+    # Make sure we have some embedding model even when run standalone.
+    _ensure_embed_model_if_missing()
+
+    acct_id = sys.argv[1] if len(sys.argv) > 1 else None
+
+    print("[BOOT] Building all indexes…")
+    res = build_all(
+        account_id=acct_id,
+        accounts_base_dir=ACCOUNTS_DATA_DIR,
+        knowledge_dir=KNOWLEDGE_DATA_DIR,
+    )
     print("[BOOT] Index build complete.")
+    print(json.dumps(res, indent=2))
