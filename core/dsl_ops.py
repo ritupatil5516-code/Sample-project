@@ -473,7 +473,131 @@ def _op_compare_periods(*, domain: str, data: Any, args: Dict[str, Any], plugin:
     ratio = (a / b) if b not in (0, 0.0) else None
     return {"a_total": a, "b_total": b, "delta": delta, "ratio": ratio, "trace": {"period1": p1, "period2": p2, "where": where}}
 
-# --------------------------------------------------------------------------------------
+
+# dsl_ops.py
+from __future__ import annotations
+from typing import Any, Dict, List, Optional
+from datetime import datetime
+
+def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s: return None
+    s = s.replace("Z", "+00:00")
+    try: return datetime.fromisoformat(s)
+    except Exception: return None
+
+def _in_range(ts: Optional[datetime], start: Optional[datetime], end: Optional[datetime]) -> bool:
+    if ts is None: return False
+    if start and ts < start: return False
+    if end   and ts > end:   return False
+    return True
+
+def _as_rows(x: Any) -> List[Dict[str, Any]]:
+    if isinstance(x, list): return [r for r in x if isinstance(r, dict)]
+    if isinstance(x, dict): return [x]
+    return []
+
+def op_explain_interest(*, domain: str, data: Any, args: Dict[str, Any], plugin: Any, scratch: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Combine latest statement (with interest) + in-period transactions (+ payments)
+    to produce a grounded explanation.
+    Returns a rich payload consumed by compose_answer.
+    """
+    st_rows = _as_rows(getattr(plugin, "rows", lambda: data)())
+    if not st_rows:
+        return {"error": "no_statements"}
+
+    # 1) Pick statement row
+    period_mode = (args or {}).get("period") or "LATEST_NONZERO"
+    def _has_interest(r: Dict[str, Any]) -> bool:
+        v = r.get("interestCharged")
+        try: return (v or 0) != 0
+        except Exception: return bool(v)
+
+    st_rows_sorted = sorted(
+        st_rows,
+        key=lambda r: _parse_dt(r.get("closingDateTime")) or _parse_dt(r.get("date")) or datetime.min
+    )
+    if period_mode == "LATEST_NONZERO":
+        st = next((r for r in reversed(st_rows_sorted) if _has_interest(r)), st_rows_sorted[-1])
+    else:
+        st = st_rows_sorted[-1]  # latest
+
+    start = _parse_dt(st.get("openingDateTime") or st.get("periodStartDateTime"))
+    end   = _parse_dt(st.get("closingDateTime") or st.get("periodEndDateTime"))
+    st_interest = float(st.get("interestCharged") or 0.0)
+    trailing    = float(st.get("totalTrailingInterest") or 0.0)
+    non_trailing = max(0.0, st_interest - trailing)
+
+    # 2) Load transactions (+ payments)
+    load_domain = (ctx or {}).get("load_domain")
+    tx_data = load_domain("transactions") if load_domain else None
+    pay_data = load_domain("payments")     if load_domain else None
+
+    tx_rows = _as_rows(tx_data) if tx_data else []
+    pay_rows = _as_rows(pay_data) if pay_data else []
+
+    # 3) In-period filters
+    def _ts_tx(r: Dict[str, Any]) -> Optional[datetime]:
+        return _parse_dt(
+            r.get("postedDateTime") or r.get("transactionDateTime") or r.get("date")
+        )
+    tx_in_period = [r for r in tx_rows if _in_range(_ts_tx(r), start, end)]
+
+    def _ts_pay(r: Dict[str, Any]) -> Optional[datetime]:
+        return _parse_dt(r.get("paymentPostedDateTime") or r.get("paymentDateTime") or r.get("date"))
+    pays_in_period = [r for r in pay_rows if _in_range(_ts_pay(r), start, end)]
+
+    # 4) Summaries
+    def _amt(r):
+        try: return float(r.get("amount") or 0.0)
+        except Exception: return 0.0
+
+    # Purchases = positive spend; refunds negative (or vice-versa depending on file).
+    # Use sign hints if present; otherwise use category/type to bucket.
+    def _is_purchase(r):
+        t = (r.get("transactionType") or "").upper()
+        disp = (r.get("displayTransactionType") or "").lower()
+        return ("PURCHASE" in t) or ("debit" in disp) or ("interest" not in disp)
+
+    purchases_total = sum(abs(_amt(r)) for r in tx_in_period if _is_purchase(r))
+    interest_txns   = [r for r in tx_in_period if "interest" in (r.get("displayTransactionType","").lower() or r.get("transactionType","").lower())]
+    interest_tx_total = sum(abs(_amt(r)) for r in interest_txns)
+    payments_total  = sum(abs(_amt(r)) for r in pays_in_period)
+
+    carried_balance_hint = float(st.get("previousStatementBalance") or st.get("openingBalance") or 0.0)
+
+    # 5) Build explanation
+    return {
+        "explain_interest": True,
+        "period": {
+            "start": st.get("openingDateTime") or st.get("periodStartDateTime"),
+            "end":   st.get("closingDateTime") or st.get("periodEndDateTime"),
+        },
+        "statement": {
+            "closingDateTime": st.get("closingDateTime"),
+            "interestCharged": st_interest,
+            "trailingInterest": trailing,
+            "nonTrailingInterest": non_trailing,
+            "isTrailingInterestApplied": bool(st.get("isTrailingInterestApplied", trailing > 0)),
+        },
+        "drivers": {
+            "carried_balance_estimate": carried_balance_hint,
+            "purchases_in_period": purchases_total,
+            "payments_in_period": payments_total,
+            "interest_transactions_total": interest_tx_total,
+        },
+        "support": {
+            "statement_row": st,
+            "interest_txn_ids": [r.get("transactionId") for r in interest_txns if r.get("transactionId")],
+            "counts": {
+                "tx_in_period": len(tx_in_period),
+                "payments_in_period": len(pays_in_period),
+            },
+        },
+        "trace": {"domain": domain, "op": "explain_interest"}
+    }
+
+# ---- register ----# --------------------------------------------------------------------------------------
 # Public registry
 # --------------------------------------------------------------------------------------
 
@@ -485,4 +609,5 @@ OPS = {
     "list_where": _op_list_where,
     "semantic_search": _op_semantic_search,
     "compare_periods": _op_compare_periods,
+    "explain_interest": op_explain_interest,
 }

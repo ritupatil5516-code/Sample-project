@@ -284,6 +284,9 @@ def compose_answer(
         elif op == "list_where":
             txt = _render_list_where(p)
             items.append(_struct_for_list_where(domain, p))
+        elif op == "explain_interest":
+            txt = _render_explain_interest(p)
+            items.append(_struct_for_explain_interest(domain, p))
         elif op == "semantic_search":
             hits = p.get("hits") or []
             if not hits:
@@ -335,3 +338,33 @@ def _render_rag(payload: Dict[str, Any]) -> str:
         snip = _shorten(s.get("snippet") or "", 160)
         lines.append(f"- {src}: {snip}")
     return "\n".join(lines)
+
+def _render_explain_interest(p: Dict[str, Any]) -> str:
+    st = p.get("statement", {})
+    pr = p.get("period", {})
+    drivers = p.get("drivers", {})
+    s_end   = _fmt_dt_iso(st.get("closingDateTime") or pr.get("end") or "")
+    total   = _fmt_money(st.get("interestCharged"))
+    trail   = float(st.get("trailingInterest") or 0.0)
+    nontr   = float(st.get("nonTrailingInterest") or 0.0)
+
+    parts = [f"You were charged {total} on {s_end}."]
+    if trail > 0:
+        parts.append(f"Of this, {_fmt_money(trail)} was trailing interest and {_fmt_money(nontr)} was new-cycle interest.")
+    cb = drivers.get("carried_balance_estimate", 0.0)
+    if cb:
+        parts.append(f"You carried about {_fmt_money(cb)} from the prior cycle.")
+    if drivers.get("purchases_in_period", 0.0):
+        parts.append(f"Purchases in the cycle totalled {_fmt_money(drivers['purchases_in_period'])}.")
+    if drivers.get("payments_in_period", 0.0):
+        parts.append(f"Payments in the cycle totalled {_fmt_money(drivers['payments_in_period'])}.")
+    if drivers.get("interest_transactions_total", 0.0):
+        parts.append(f"Interest transactions posted: {_fmt_money(drivers['interest_transactions_total'])} (see sources).")
+    return " ".join(parts)
+
+def _struct_for_explain_interest(domain: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "domain": domain,
+        "capability": "explain_interest",
+        **{k: payload.get(k) for k in ("period", "statement", "drivers", "support", "trace")}
+    }
