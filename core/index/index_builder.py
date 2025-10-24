@@ -1,8 +1,8 @@
 # core/index/index_builder.py
 from __future__ import annotations
-import json, os
+import json, os, shutil
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # ---- LlamaIndex (FAISS persist) ----
 from llama_index.core import Document, StorageContext, VectorStoreIndex, SimpleDirectoryReader
@@ -55,7 +55,6 @@ def _discover_accounts(cfg: Dict[str, Any]) -> List[str]:
         ids = data_cfg.get("accounts")
         if isinstance(ids, list) and ids:
             return [str(x) for x in ids]
-        # If API has an endpoint to list accounts, you can add that later.
         print("[index_builder] data.provider=api but no data.accounts list; skipping account indexes.")
         return []
 
@@ -66,7 +65,6 @@ def _discover_accounts(cfg: Dict[str, Any]) -> List[str]:
     out = []
     for child in root.iterdir():
         if child.is_dir():
-            # consider directory an account if it contains any of our jsons
             has_any = any((child / f).exists() for f in (
                 "transactions.json", "payments.json", "statements.json", "account_summary.json"))
             if has_any:
@@ -75,35 +73,86 @@ def _discover_accounts(cfg: Dict[str, Any]) -> List[str]:
 
 
 # =========================
+# Ensure embed model
+# =========================
+def _ensure_embed_model() -> None:
+    """
+    Make sure an embedding model is set before building.
+    If your runtime config sets LISettings.embed_model, this is a no-op.
+    """
+    if LISettings.embed_model is None:
+        # good default; replace with your OpenAI embed if desired
+        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+        LISettings.embed_model = HuggingFaceEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+
+
+def _embedding_dim() -> int:
+    _ensure_embed_model()
+    v = LISettings.embed_model.get_text_embedding("probe")
+    return len(v)
+
+
+# =========================
 # JSON → Documents
 # =========================
+def _flatten_kv(row: Any, prefix: str = "") -> List[str]:
+    """
+    Flatten dict/list scalars into key=value strings. Useful to “include all fields”.
+    """
+    out: List[str] = []
+    if isinstance(row, dict):
+        for k, v in row.items():
+            key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, (dict, list)):
+                out.extend(_flatten_kv(v, key))
+            else:
+                try:
+                    out.append(f"{key}={json.dumps(v, ensure_ascii=False)}")
+                except Exception:
+                    out.append(f"{key}={v}")
+    elif isinstance(row, list):
+        for i, v in enumerate(row):
+            key = f"{prefix}[{i}]"
+            if isinstance(v, (dict, list)):
+                out.extend(_flatten_kv(v, key))
+            else:
+                try:
+                    out.append(f"{key}={json.dumps(v, ensure_ascii=False)}")
+                except Exception:
+                    out.append(f"{key}={v}")
+    return out
+
+
 def _doc_from_row(domain: str, acc_id: str, row: Dict[str, Any], path_hint: str) -> Document:
     """
-    Flatten a record into a compact text summary with useful fields pronounced.
-    Keep full JSON in metadata for grounding/audit.
+    Build a document text that front-loads key fields, then adds a kv_dump (all fields),
+    then full JSON. This greatly improves RAG recall without handpicking fields.
     """
-    # Pull a few common fields first (front-load relevance)
+    # Front-load some high-signal fields
     pieces: List[str] = [f"domain={domain}", f"accountId={acc_id}"]
-    # transactions
     if "merchantName" in row: pieces.append(f"merchant={row.get('merchantName')}")
     if "description" in row:  pieces.append(f"desc={row.get('description')}")
     if "amount" in row:       pieces.append(f"amount={row.get('amount')}")
-    # payments
     if "paymentAmount" in row and "amount" not in row: pieces.append(f"amount={row.get('paymentAmount')}")
-    # statements
     if "period" in row:       pieces.append(f"period={row.get('period')}")
     if "interestCharged" in row: pieces.append(f"interest={row.get('interestCharged')}")
 
-    # any timestamp-like
+    # any timestamp-like (first one found)
     for k in ("postedDateTime","transactionDateTime","paymentPostedDateTime","paymentDateTime",
               "closingDateTime","openingDateTime","date"):
         if k in row and row[k]:
-            pieces.append(f"{k}={row[k]}"); break
+            pieces.append(f"{k}={row[k]}")
+            break
 
-    # compact headline + full JSON tail
     head = " | ".join(pieces)
+
+    # kv_dump: all keys flattened as key=value
+    kv_dump = " ".join(_flatten_kv(row))
+
+    # tail: full JSON for auditability
     tail = json.dumps(row, ensure_ascii=False)
-    text = f"{head}\n{tail}"
+
+    text = f"{head}\n{kv_dump}\n{tail}"
 
     meta = {
         "source": path_hint,
@@ -114,11 +163,7 @@ def _doc_from_row(domain: str, acc_id: str, row: Dict[str, Any], path_hint: str)
 
 
 def _docs_for_account(cfg: Dict[str, Any], account_id: str) -> List[Document]:
-    """
-    Load all four JSONs for an account and convert to Documents.
-    """
     docs: List[Document] = []
-    # Each loader is already abstracted (local/api)
     txns = load_transactions(account_id, cfg) or []
     pays = load_payments(account_id, cfg) or []
     stmts = load_statements(account_id, cfg) or []
@@ -135,11 +180,8 @@ def _docs_for_account(cfg: Dict[str, Any], account_id: str) -> List[Document]:
             docs.append(_doc_from_row("statements", account_id, s, f"statements:{account_id}"))
 
     if isinstance(acct, dict) and acct:
-        # store the account summary as a single document with full JSON
-        head = f"domain=accounts | accountId={account_id}"
-        text = f"{head}\n{json.dumps(acct, ensure_ascii=False)}"
-        docs.append(Document(text=text, metadata={"source": f"account_summary:{account_id}",
-                                                  "domain": "accounts", "accountId": account_id}))
+        docs.append(_doc_from_row("accounts", account_id, acct, f"account_summary:{account_id}"))
+
     return docs
 
 
@@ -148,19 +190,36 @@ def _docs_for_account(cfg: Dict[str, Any], account_id: str) -> List[Document]:
 # =========================
 def _persist_index_from_docs(docs: List[Document], out_dir: Path) -> None:
     """
-    Idempotent: if index exists and rebuild not requested, we don't touch it.
-    Else build a FAISS-backed VectorStoreIndex and persist.
+    Build a FAISS-backed VectorStoreIndex and persist a COMPLETE store:
+      - faiss.index (FAISS binary)
+      - index_store.json
+      - docstore.json
+      - vector_store.json (name may vary by LI version)
     """
+    _ensure_embed_model()
     out_dir.mkdir(parents=True, exist_ok=True)
-    vector_store = FaissVectorStore()  # dimension inferred from embedding model via LlamaIndex
+
+    # Build FAISS explicitly with correct dimension
+    import faiss
+    dim = _embedding_dim()
+    fa = faiss.IndexFlatIP(dim)  # cosine (normalize upstream if desired)
+
+    vector_store = FaissVectorStore(faiss_index=fa)
     storage = StorageContext.from_defaults(vector_store=vector_store, persist_dir=str(out_dir))
-    _ = VectorStoreIndex.from_documents(docs, storage_context=storage)
+
+    VectorStoreIndex.from_documents(docs, storage_context=storage, show_progress=True)
     storage.persist(persist_dir=str(out_dir))
+
+    # Sanity check: ensure core files exist
+    need = {"docstore.json", "index_store.json"}
+    have = {p.name for p in out_dir.glob("*.json")}
+    if not need.issubset(have):
+        raise RuntimeError(f"Persist incomplete @ {out_dir}. Missing: {need - have}")
 
 
 def _index_exists(dir_path: Path) -> bool:
-    # minimal heuristic; you can add more files if your persist format differs
-    return (dir_path / "faiss.index").exists() or (dir_path / "index_store.json").exists()
+    # Require BOTH docstore and index_store; prevents skipping half-written dirs
+    return (dir_path / "docstore.json").exists() and (dir_path / "index_store.json").exists()
 
 
 # =========================
@@ -168,12 +227,17 @@ def _index_exists(dir_path: Path) -> bool:
 # =========================
 def ensure_account_index(cfg: Dict[str, Any], account_id: str, force_rebuild: bool = False) -> Dict[str, Any]:
     root = _index_root(cfg)
-    out_dir = root / "accounts" / str(account_id)
+    out_dir = root / "accounts" / str(account_id) / "llama"  # align with loaders expecting .../llama
     if _index_exists(out_dir) and not (force_rebuild or _should_rebuild(cfg)):
         return {"account_id": account_id, "persist_dir": out_dir.as_posix(), "status": "exists"}
 
+    # (Re)build
+    if out_dir.exists() and (force_rebuild or _should_rebuild(cfg)):
+        shutil.rmtree(out_dir, ignore_errors=True)
+
     docs = _docs_for_account(cfg, account_id)
     if not docs:
+        out_dir.mkdir(parents=True, exist_ok=True)
         return {"account_id": account_id, "persist_dir": out_dir.as_posix(), "status": "skipped", "reason": "no_docs"}
 
     _persist_index_from_docs(docs, out_dir)
@@ -194,15 +258,18 @@ def ensure_all_account_indexes(cfg: Dict[str, Any], force_rebuild: bool = False)
 def ensure_knowledge_index(cfg: Dict[str, Any], force_rebuild: bool = False) -> Dict[str, Any]:
     """
     Build a single knowledge index from handbook + policy/agreement docs.
-    Defaults:
-      - data/knowledge/ (e.g., handbook.md, .txt)
-      - data/agreement/ (e.g., Apple-Card-Customer-Agreement.pdf)
-    You can override via config.knowledge.sources: [ "dir1", "dir2", "fileX.pdf" ]
+    Looks under:
+      - data/knowledge/
+      - data/agreement/
+    Override with config.knowledge.sources: [ "dir1", "dir2", "fileX.pdf" ].
     """
     root = _index_root(cfg)
-    out_dir = root / "knowledge"
+    out_dir = root / "knowledge" / "llama"  # <-- keep consistent with RAG loader
     if _index_exists(out_dir) and not (force_rebuild or _should_rebuild(cfg)):
         return {"persist_dir": out_dir.as_posix(), "status": "exists"}
+
+    if out_dir.exists() and (force_rebuild or _should_rebuild(cfg)):
+        shutil.rmtree(out_dir, ignore_errors=True)
 
     # Collect sources
     kcfg = (cfg.get("knowledge") or {})
@@ -224,11 +291,13 @@ def ensure_knowledge_index(cfg: Dict[str, Any], force_rebuild: bool = False) -> 
             files.append(s)
 
     if not files:
+        out_dir.mkdir(parents=True, exist_ok=True)
         return {"persist_dir": out_dir.as_posix(), "status": "skipped", "reason": "no_sources"}
 
     reader = SimpleDirectoryReader(input_files=[str(p) for p in files])
     docs = reader.load_data()
     if not docs:
+        out_dir.mkdir(parents=True, exist_ok=True)
         return {"persist_dir": out_dir.as_posix(), "status": "skipped", "reason": "empty_docs"}
 
     _persist_index_from_docs(docs, out_dir)
