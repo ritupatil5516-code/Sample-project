@@ -118,6 +118,16 @@ def _fmt_money(v: Any) -> str:
     except Exception:
         return str(v)
 
+# Normalize timestamp precedence (so “latest” works reliably everywhere)
+def _norm_ts(row: Dict[str, Any]) -> Optional[str]:
+    return _first(
+        row.get("postedDateTime"),
+        row.get("transactionDateTime"),
+        row.get("paymentPostedDateTime"),
+        row.get("paymentDateTime"),
+        row.get("closingDateTime"),
+        row.get("date"),
+    )
 
 # ============================== Knowledge index ================================
 
@@ -176,8 +186,7 @@ def _rows(obj: Any) -> List[Dict[str, Any]]:
 
 # ---------- Renderers (text for embedding) ----------
 
-def _render_transaction(r: Dict[str, Any]) -> str:
-    ts = _first(r.get("postedDateTime"), r.get("transactionDateTime"))
+def _render_transaction(r: Dict[str, Any], tags: List[str], ts: Optional[str]) -> str:
     amt = _fmt_money(r.get("amount"))
     m   = r.get("merchantName") or r.get("description") or ""
     cat = r.get("category") or r.get("merchantCategoryName") or ""
@@ -187,38 +196,34 @@ def _render_transaction(r: Dict[str, Any]) -> str:
     sign= _amount_sign(r)
     parts = [
         "TRANSACTION",
-        f"date={ts}" if ts else "",
+        f"ts={ts}" if ts else "",
         f"merchant={m}" if m else "",
         f"category={cat}" if cat else "",
         f"type={disp}",
         f"status={stat}" if stat else "",
         f"amount={amt}",
         f"sign={sign}",
+        f"tags={','.join(tags)}" if tags else "",
     ]
-    # mark interest explicitly
-    if "interest" in str(disp).lower() or "interest" in str(m).lower():
-        parts.append("tag=interest")
-    if "refund" in str(disp).lower() or sign == "CREDIT":
-        parts.append("tag=refund_or_credit")
     if note:
         parts.append(f"notes={note}")
     return " | ".join([p for p in parts if p])
 
-def _render_payment(r: Dict[str, Any]) -> str:
-    ts = _first(r.get("paymentPostedDateTime"), r.get("paymentDateTime"))
+def _render_payment(r: Dict[str, Any], tags: List[str], ts: Optional[str]) -> str:
     amt = _fmt_money(r.get("amount"))
     src = (r.get("fundingSource") or {}).get("accountType") or r.get("fundingType") or ""
     stat= r.get("state") or r.get("status") or ""
     parts = [
         "PAYMENT",
-        f"date={ts}" if ts else "",
+        f"ts={ts}" if ts else "",
         f"amount={amt}",
         f"status={stat}" if stat else "",
         f"source={src}" if src else "",
+        f"tags={','.join(tags)}" if tags else "",
     ]
     return " | ".join([p for p in parts if p])
 
-def _render_statement(r: Dict[str, Any]) -> str:
+def _render_statement(r: Dict[str, Any], tags: List[str], ts: Optional[str]) -> str:
     close = r.get("closingDateTime")
     due   = _first(r.get("dueDateTime"), r.get("dueDate"))
     int_ch= r.get("interestCharged", 0.0)
@@ -228,19 +233,19 @@ def _render_statement(r: Dict[str, Any]) -> str:
     pays  = r.get("totalPayments", r.get("paymentsAndCredits", None))
     parts = [
         "STATEMENT",
+        f"ts={ts}" if ts else "",
         f"closing={close}" if close else "",
         f"due={due}" if due else "",
         f"interestCharged={_fmt_money(int_ch)}",
         f"nonTrailing={_fmt_money(int_nt)}",
         f"trailing={_fmt_money(int_tr)}",
+        f"tags={','.join(tags)}" if tags else "",
     ]
     if purch is not None: parts.append(f"purchases={_fmt_money(purch)}")
     if pays  is not None: parts.append(f"payments={_fmt_money(pays)}")
-    if _bool(r.get("isTrailingInterestApplied")):
-        parts.append("tag=trailing_interest_applied")
     return " | ".join([p for p in parts if p])
 
-def _render_account_summary(r: Dict[str, Any]) -> str:
+def _render_account_summary(r: Dict[str, Any], tags: List[str], ts: Optional[str]) -> str:
     bal = r.get("currentBalance", r.get("currentAdjustedBalance"))
     avail = r.get("availableCredit")
     cl   = r.get("creditLimit")
@@ -248,25 +253,65 @@ def _render_account_summary(r: Dict[str, Any]) -> str:
     due_date = _first(r.get("paymentDueDateTime"), r.get("paymentDueDate"))
     parts = [
         "ACCOUNT_SUMMARY",
+        f"ts={ts}" if ts else "",
         f"status={status}" if status else "",
         f"currentBalance={_fmt_money(bal)}" if bal is not None else "",
         f"availableCredit={_fmt_money(avail)}" if avail is not None else "",
         f"creditLimit={_fmt_money(cl)}" if cl is not None else "",
         f"nextPaymentDue={due_date}" if due_date else "",
+        f"tags={','.join(tags)}" if tags else "",
     ]
     return " | ".join([p for p in parts if p])
+
+# ---------- Tagger (generic, built-in) ----------
+
+def _tag_row(domain: str, r: Dict[str, Any]) -> List[str]:
+    tags: List[str] = []
+    disp = str(r.get("displayTransactionType") or r.get("transactionType") or "").lower()
+    m    = str(r.get("merchantName") or r.get("description") or "").lower()
+    stat = str(r.get("transactionStatus") or r.get("status") or "").lower()
+    sign = _amount_sign(r)
+
+    # generic domain tags
+    if domain == "transactions": tags.append("transaction")
+    if domain == "payments":     tags.append("payment")
+    if domain == "statements":   tags.append("statement")
+    if domain == "account_summary": tags.append("account")
+
+    # interest
+    if domain == "statements":
+        try:
+            if float(r.get("interestCharged", 0)) > 0:
+                tags.append("interest_charge")
+        except Exception:
+            pass
+    # interest tx vs interest credit
+    if "interest" in disp or "interest" in m:
+        if sign == "DEBIT":
+            tags.append("interest_charge")
+        elif sign == "CREDIT":
+            tags.append("interest_credit")
+
+    # refunds / credits / reversals
+    if "reversal" in disp or "chargeback" in disp:
+        tags.append("reversal")
+    if sign == "CREDIT" and domain == "transactions":
+        tags.append("refund_or_credit")
+
+    # declines
+    if stat == "declined":
+        tags.append("declined")
+
+    # purchases (big picture)
+    if domain == "transactions" and (sign == "DEBIT"):
+        tags.append("purchase")
+
+    return sorted(set(tags))
 
 # ---------- Metadata builder ----------
 
 def _base_meta(account_id: str, domain: str, r: Dict[str, Any]) -> Dict[str, Any]:
-    ts = _first(
-        r.get("postedDateTime"),
-        r.get("transactionDateTime"),
-        r.get("paymentPostedDateTime"),
-        r.get("paymentDateTime"),
-        r.get("closingDateTime"),
-        r.get("date"),
-    )
+    ts = _norm_ts(r)
     ym = _yyyy_mm_from_iso(ts) or r.get("period")
     meta: Dict[str, Any] = {
         "account_id": account_id,
@@ -284,11 +329,6 @@ def _base_meta(account_id: str, domain: str, r: Dict[str, Any]) -> Dict[str, Any
         "postedDateTime": r.get("postedDateTime"),
         "transactionDateTime": r.get("transactionDateTime"),
     }
-    # interest flags
-    disp = str(r.get("displayTransactionType") or "").lower()
-    m    = str(r.get("merchantName") or "").lower()
-    meta["is_interest_charge_tx"]  = ("interest" in disp and "credit" not in disp) or ("interest" in m and meta["amount_sign"] == "DEBIT")
-    meta["is_interest_credit_tx"]  = "interest" in disp and "credit" in disp or meta["amount_sign"] == "CREDIT"
 
     # statement interest numbers if present
     if domain == "statements":
@@ -298,23 +338,26 @@ def _base_meta(account_id: str, domain: str, r: Dict[str, Any]) -> Dict[str, Any
         meta["isTrailingInterestApplied"]  = _bool(r.get("isTrailingInterestApplied"))
     return meta
 
-# ---------- Add rows for each domain (core change you asked for) ----------
+# ---------- Add rows for each domain (with TAGS + ts in text+metadata) ----------
 
 def _add_rows(docs: List[Document], domain: str, account_id: str, rows: List[Dict[str, Any]]) -> None:
     for r in rows:
+        ts   = _norm_ts(r)
+        tags = _tag_row(domain, r)
         meta = _base_meta(account_id, domain, r)
+        meta["tags"] = tags
 
         if domain == "transactions":
-            text = _render_transaction(r)
+            text = _render_transaction(r, tags, ts)
             key  = r.get("transactionId")
         elif domain == "payments":
-            text = _render_payment(r)
+            text = _render_payment(r, tags, ts)
             key  = r.get("paymentId")
         elif domain == "statements":
-            text = _render_statement(r)
+            text = _render_statement(r, tags, ts)
             key  = r.get("statementId")
         else:  # account_summary
-            text = _render_account_summary(r)
+            text = _render_account_summary(r, tags, ts)
             key  = r.get("accountId")
 
         meta["key"] = key
@@ -369,6 +412,9 @@ def build_account_index(
 
 
 # ============================== Build both =====================================
+
+def ensure_knowledge_index_and_return(knowledge_dir: Union[str, Path] = KNOWLEDGE_DATA_DIR) -> BuildResult:
+    return ensure_knowledge_index(knowledge_dir=knowledge_dir, persist_dir=KNOWLEDGE_INDEX_DIR)
 
 def build_all(
     account_id: Optional[str] = None,

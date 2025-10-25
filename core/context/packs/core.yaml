@@ -47,6 +47,45 @@ extras:
   - Show money with a currency symbol and two decimals.
   - Normalize dates to YYYY-MM-DD in text.
 
+tagger_rules:
+  # optional: central knobs the reducer can also read
+  recency_words: ["last", "latest", "recent", "most recent", "when"]
+  query_tag_map:
+    interest: ["interest_charge"]
+    fee: ["fee"]
+    payment: ["payment"]
+    reversal: ["reversal"]
+
+  # rules used by the index builder to tag every row (generic, domain-agnostic)
+  rules:
+    # Transactions
+    - when_any:
+        - "transactionType == 'INTEREST'"
+        - "displayTransactionType ~= '^interest'"
+      then: ["interest_charge"]
+
+    - when_any:
+        - "displayTransactionType == 'REVERSAL'"
+      then: ["reversal"]
+
+    - when_any:
+        - "transactionType == 'FEE'"
+        - "displayTransactionType ~= 'fee'"
+      then: ["fee"]
+
+    # Payments
+    - when_any:
+        - "paymentPostedDateTime"
+        - "paymentDateTime"
+      then: ["payment"]
+
+    # Statements (non-zero interest)
+    - apply_to: "statements"
+      when_any:
+        - "interestCharged > 0"
+      then: ["interest_charge"]
+
+
 planner_rules:
   version: 2
 
