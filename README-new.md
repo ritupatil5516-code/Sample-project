@@ -39,35 +39,44 @@ Both paths share the same data and indexes, and the **planner** picks the right 
 
 ```mermaid
 flowchart LR
-  subgraph Ingestion & Indexing
-    A1[customer_data/<account_id>/\\ntransactions.json\\npayments.json\\nstatements.json\\naccount_summary.json]
-    A2[data/knowledge/\\nhandbook.md, PDFs...]
-    B1[index_builder.py\\n- render rows to text\\n- add rich metadata\\n- append RAW_JSON\\n- build FAISS]
+  %% ---------- Ingestion & Indexing ----------
+  subgraph Ingestion_and_Indexing
+    A1["customer_data/&lt;account_id&gt;/<br/>transactions.json · payments.json · statements.json · account_summary.json"]
+    A2["data/knowledge/<br/>handbook.md · PDFs · txt"]
+    B1["index_builder.py<br/>render rows → text<br/>append RAW_JSON<br/>build FAISS"]
+    C1["indexesstore/accounts/&lt;id&gt;/llama"]
+    C2["indexesstore/knowledge/llama"]
+
     A1 --> B1
     A2 --> B1
-    B1 --> I1[(FAISS + stores)\\nindexesstore/accounts/<id>/llama]
-    B1 --> I2[(FAISS + stores)\\nindexesstore/knowledge/llama]
+    B1 --> C1
+    B1 --> C2
   end
 
+  %% ---------- Runtime ----------
   subgraph Runtime
-    P1[core.yaml\\nplanner rules\\nroutes + synonyms]
-    E1[dsl_ops.py\\n(get_field, find_latest,\\nlist_where, sum_where, ...)]
-    O1[orchestrator\\n(plan -> execute -> compose)]
-    R1[rag_chain.py\\n(LI retrieve +\\nLLM synthesize)]
-    L1[RUNTIME\\n- config\\n- LLM client\\n- embedder\\n- memory]
-  end
+    O1["User question"]
+    P1["Planner (core.yaml)"]
+    E1["Deterministic executor (dsl_ops.py)"]
+    R1["Unified RAG (rag_chain.py)"]
+    D1["Domain loaders (JSON providers)"]
+    L1["LLM client + embeddings + memory (runtime)"]
 
-  Q[User question] --> O1
-  O1 --> P1
-  P1 -- "deterministic plan" --> E1
-  P1 -- "rag:unified plan" --> R1
-  E1 <-- domain loaders --> D[(domain data providers)]
-  R1 --> I1
-  R1 --> I2
-  E1 --> O1
-  R1 --> O1
-  L1 -. used by .-> R1
-  O1 --> A[Answer + sources]
+    O1 --> P1
+    P1 -->|deterministic plan| E1
+    P1 -->|rag:unified plan| R1
+
+    %% deterministic path uses local data
+    E1 --> D1
+    D1 --> E1
+    E1 --> O1
+
+    %% rag path uses indexes + llm
+    R1 --> C1
+    R1 --> C2
+    R1 --> L1
+    L1 --> O1
+  end
 ```
 
 ---
@@ -185,39 +194,26 @@ flowchart LR
 
 ## End-to-end Request Flow
 
-```mermaid
-sequenceDiagram
-  autonumber
+```mermaidsequenceDiagram
   participant U as User
-  participant O as Orchestrator
   participant P as Planner (core.yaml)
-  participant D as Deterministic Ops (dsl_ops)
+  participant E as Executor (dsl_ops)
+  participant D as Domain loaders
   participant R as RAG (rag_chain)
-  participant I as Indexes (FAISS via LlamaIndex)
-  participant RT as RUNTIME (LLM/Embedder)
+  participant L as LLM
 
-  U->>O: "When was my last interest charge?"
-  O->>P: Build plan (use synonyms + routes)
-  P-->>O: Plan: statements.find_latest(interestCharged>0) + txn fallback
-  O->>D: Execute find_latest on statements
-  D-->>O: Row + value (closingDateTime + interestCharged)
-  alt No statement with interest
-    O->>D: find_latest on transactions where type=INTEREST
-    D-->>O: Latest interest transaction row
+  U->>P: "When was my last payment?"
+  alt deterministic
+    P->>E: plan: payments.find_latest(paymentPostedDateTime)
+    E->>D: load payments.json
+    D-->>E: rows
+    E-->>U: latest timestamp + amount
+  else why/explain
+    U->>P: "Why did I accrue interest?"
+    P->>R: rag:unified
+    R->>L: context from indexesstore/.../llama
+    L-->>U: grounded explanation + sources
   end
-  O->>O: Compose friendly answer
-  O-->>U: "You were last charged interest on 2025-04-01 for $4.59."
-
-  Note over U,O: For “why/explain” questions
-  U->>O: "Why did I accrue interest?"
-  O->>P: Build plan → strategy "rag:unified"
-  O->>R: unified_rag_answer(question)
-  R->>I: retrieve from accounts + knowledge
-  I-->>R: nodes (text + RAW_JSON)
-  R->>RT: LLM with grounded context
-  RT-->>R: explanation text
-  R-->>O: answer + sources
-  O-->>U: Explanation + citations/snippets
 ```
 
 ---
