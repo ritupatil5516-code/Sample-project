@@ -194,7 +194,8 @@ flowchart LR
 
 ## End-to-end Request Flow
 
-```mermaidsequenceDiagram
+```mermaid
+sequenceDiagram
   participant U as User
   participant P as Planner (core.yaml)
   participant E as Executor (dsl_ops)
