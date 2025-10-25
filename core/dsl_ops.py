@@ -1,4 +1,4 @@
-# dsl_ops.py
+from datetime import datetime, timedelta, timezone
 from __future__ import annotations
 from typing import Any, Dict, List, Iterable, Optional, Tuple
 from datetime import datetime, timedelta
@@ -19,20 +19,25 @@ _MONEY_FIELDS = {"amount", "interestCharged", "paymentAmount"}
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
+
 def _now() -> datetime:
-    return datetime.utcnow()
+    # always timezone-aware
+    return datetime.now(timezone.utc)
 
 def _to_dt(v: Any) -> Optional[datetime]:
+    """Parse ISO strings (with or without 'Z' / offset) into UTC tz-aware datetimes."""
     if not v:
         return None
-    s = str(v)
+    s = str(v).strip()
+    if s.endswith("Z"):            # '...Z' → '+00:00' so fromisoformat can parse
+        s = s[:-1] + "+00:00"
     try:
-        # accept "Z"
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except Exception:
         return None
+    if dt.tzinfo is None:          # naive → assume UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 def _fmt_money(x: Any) -> str:
     try:
@@ -193,7 +198,7 @@ def _match_simple(val: Any, cond: Any) -> bool:
     return val == cond
 
 def _month_floor(dt: datetime) -> datetime:
-    return datetime(dt.year, dt.month, 1)
+    return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
 
 def _prev_month(dt: datetime, n: int = 1) -> datetime:
     y, m = dt.year, dt.month
@@ -201,7 +206,7 @@ def _prev_month(dt: datetime, n: int = 1) -> datetime:
     while m <= 0:
         m += 12
         y -= 1
-    return datetime(y, m, 1)
+    return datetime(y, m, 1, tzinfo=timezone.utc)
 
 def _in_period_symbol(row: Dict[str, Any], sym: str) -> bool:
     dt = _row_dt(row)
@@ -223,20 +228,25 @@ def _in_period_symbol(row: Dict[str, Any], sym: str) -> bool:
         return start <= dt < end
     m_q = re.match(r"^(\d{4})-Q([1-4])$", sym)
     if m_q:
-        y = int(m_q.group(1)); q = int(m_q.group(2))
+        y = int(m_q.group(1));
+        q = int(m_q.group(2))
         start_m = (q - 1) * 3 + 1
-        start = datetime(y, start_m, 1)
+        start = datetime(y, start_m, 1, tzinfo=timezone.utc)
         end_m = start_m + 3
         end_y = y + (1 if end_m > 12 else 0)
         end_m = end_m if end_m <= 12 else end_m - 12
-        end = datetime(end_y, end_m, 1)
+        end = datetime(end_y, end_m, 1, tzinfo=timezone.utc)
         return start <= dt < end
+
     m_m = re.match(r"^(\d{4})-(0[1-9]|1[0-2])$", sym)
     if m_m:
-        y = int(m_m.group(1)); m = int(m_m.group(2))
-        start = datetime(y, m, 1)
-        end_m = m + 1; end_y = y + (1 if end_m > 12 else 0); end_m = 1 if end_m == 13 else end_m
-        end = datetime(end_y, end_m, 1)
+        y = int(m_m.group(1));
+        m = int(m_m.group(2))
+        start = datetime(y, m, 1, tzinfo=timezone.utc)
+        end_m = m + 1;
+        end_y = y + (1 if end_m > 12 else 0);
+        end_m = 1 if end_m == 13 else end_m
+        end = datetime(end_y, end_m, 1, tzinfo=timezone.utc)
         return start <= dt < end
     return False
 
@@ -276,7 +286,7 @@ def _sort_rows(rows: List[Dict[str, Any]], sort_by: str) -> List[Dict[str, Any]]
         v = _get_path(r, key)
         if key in _DATE_KEYS:
             dt = _to_dt(v)
-            return dt or datetime.min
+            return dt or datetime.min.replace(tzinfo=timezone.utc)
         if isinstance(v, (int, float)): return v
         try: return float(v)
         except Exception: return str(v)
@@ -474,21 +484,16 @@ def _op_compare_periods(*, domain: str, data: Any, args: Dict[str, Any], plugin:
     return {"a_total": a, "b_total": b, "delta": delta, "ratio": ratio, "trace": {"period1": p1, "period2": p2, "where": where}}
 
 
-# dsl_ops.py
-from __future__ import annotations
-from typing import Any, Dict, List, Optional
-from datetime import datetime
-
 def _parse_dt(s: Optional[str]) -> Optional[datetime]:
-    if not s: return None
-    s = s.replace("Z", "+00:00")
-    try: return datetime.fromisoformat(s)
-    except Exception: return None
+    return _to_dt(s)
 
 def _in_range(ts: Optional[datetime], start: Optional[datetime], end: Optional[datetime]) -> bool:
-    if ts is None: return False
-    if start and ts < start: return False
-    if end   and ts > end:   return False
+    if ts is None:
+        return False
+    if start and ts < start:
+        return False
+    if end and ts > end:
+        return False
     return True
 
 def _as_rows(x: Any) -> List[Dict[str, Any]]:
